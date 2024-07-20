@@ -127,6 +127,11 @@ public:
       }
       break;
     }
+    case D3D11_QUERY_TIMESTAMP:
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      // ignore
+      break;
+    }
     default:
       ERR("Unknown query type ", desc.Query);
       break;
@@ -145,6 +150,11 @@ public:
       ((IMTLD3DOcclusionQuery *)pAsync)->End(ctx.NextOcclusionQuerySeq());
       break;
     }
+    case D3D11_QUERY_TIMESTAMP:
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      // ignore
+      break;
+    }
     default:
       ERR("Unknown query type ", desc.Query);
       break;
@@ -161,7 +171,8 @@ public:
       return E_INVALIDARG;
 
     if (GetDataFlags != D3D11_ASYNC_GETDATA_DONOTFLUSH) {
-      PromoteFlush();
+      Flush();
+      ctx.InvalidateCurrentPass();
     }
 
     D3D11_QUERY_DESC desc;
@@ -174,6 +185,19 @@ public:
       uint64_t null_data;
       uint64_t *data_ptr = pData ? (uint64_t *)pData : &null_data;
       return ((IMTLD3DOcclusionQuery *)pAsync)->GetData(data_ptr);
+    }
+    case D3D11_QUERY_TIMESTAMP: {
+      if (pData) {
+        (*static_cast<uint64_t *>(pData)) = 0;
+      }
+      return S_OK;
+    }
+    case D3D11_QUERY_TIMESTAMP_DISJOINT: {
+      if (pData) {
+        (*static_cast<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT *>(pData)) = {1,
+                                                                        TRUE};
+      }
+      return S_OK;
     }
     default:
       ERR("Unknown query type ", desc.Query);
@@ -193,11 +217,11 @@ public:
         return E_INVALIDARG;
       case D3D11_MAP_WRITE_DISCARD: {
         dynamic->RotateBuffer(this);
-        Out.pData = dynamic->GetMappedMemory(&Out.RowPitch);
+        Out.pData = dynamic->GetMappedMemory(&Out.RowPitch, &Out.DepthPitch);
         break;
       }
       case D3D11_MAP_WRITE_NO_OVERWRITE: {
-        Out.pData = dynamic->GetMappedMemory(&Out.RowPitch);
+        Out.pData = dynamic->GetMappedMemory(&Out.RowPitch, &Out.DepthPitch);
         break;
       }
       }
@@ -223,10 +247,11 @@ public:
         // FIXME: bugprone
         if (ret + coh == cmd_queue.CurrentSeqId()) {
           TRACE("Map: forced flush");
-          PromoteFlush();
+          Flush();
+          ctx.InvalidateCurrentPass();
         }
         TRACE("staging map block");
-        cmd_queue.YieldUntilCoherenceBoundaryUpdate();
+        cmd_queue.FIXME_YieldUntilCoherenceBoundaryUpdate(coh);
       };
     };
     D3D11_ASSERT(0 && "unknown mapped resource (USAGE_DEFAULT?)");
@@ -246,7 +271,10 @@ public:
   }
 
   void Flush() override {
-    FlushInternal([](auto) {}, []() {}, false);
+    if (cmd_queue.CurrentChunk()->has_no_work_encoded_yet()) {
+      return;
+    }
+    ctx.promote_flush = true;
   }
 
   void ExecuteCommandList(ID3D11CommandList *pCommandList,
@@ -280,7 +308,65 @@ public:
   void
   ClearUnorderedAccessViewUint(ID3D11UnorderedAccessView *pUnorderedAccessView,
                                const UINT Values[4]) override {
-    IMPLEMENT_ME
+    D3D11_UNORDERED_ACCESS_VIEW_DESC desc;
+    pUnorderedAccessView->GetDesc(&desc);
+    Com<IMTLBindable> bindable;
+    pUnorderedAccessView->QueryInterface(IID_PPV_ARGS(&bindable));
+    auto value =
+        std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]});
+    switch (desc.ViewDimension) {
+    case D3D11_UAV_DIMENSION_UNKNOWN:
+      return;
+    case D3D11_UAV_DIMENSION_BUFFER: {
+      if (desc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
+        ctx.EmitComputeCommandChk<true>(
+            [buffer = bindable->UseBindable(cmd_queue.CurrentSeqId()),
+             value](auto encoder, auto &ctx) {
+              ctx.queue->clear_cmd.ClearBufferUint(encoder, buffer.buffer(),
+                                                   buffer.offset(),
+                                                   buffer.width() >> 2, value);
+            });
+      } else {
+        if (desc.Format == DXGI_FORMAT_UNKNOWN) {
+          ctx.EmitComputeCommandChk<true>(
+              [buffer = bindable->UseBindable(cmd_queue.CurrentSeqId()),
+               value](auto encoder, auto &ctx) {
+                ctx.queue->clear_cmd.ClearBufferUint(
+                    encoder, buffer.buffer(), buffer.offset(),
+                    buffer.width() >> 2, value);
+              });
+        } else {
+          ctx.EmitComputeCommandChk<true>(
+              [tex = bindable->UseBindable(cmd_queue.CurrentSeqId()),
+               value](auto encoder, auto &ctx) {
+                ctx.queue->clear_cmd.ClearTextureBufferUint(
+                    encoder, tex.texture(&ctx), value);
+              });
+        }
+      }
+      break;
+    }
+    case D3D11_UAV_DIMENSION_TEXTURE1D:
+      D3D11_ASSERT(0 && "tex1d clear");
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
+      D3D11_ASSERT(0 && "tex1darr clear");
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE2D:
+      ctx.EmitComputeCommandChk<true>(
+          [tex = bindable->UseBindable(cmd_queue.CurrentSeqId()),
+           value](auto encoder, auto &ctx) {
+            ctx.queue->clear_cmd.ClearTexture2DUint(encoder, tex.texture(&ctx),
+                                                    value);
+          });
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
+      D3D11_ASSERT(0 && "tex2darr clear");
+      break;
+    case D3D11_UAV_DIMENSION_TEXTURE3D:
+      D3D11_ASSERT(0 && "tex3d clear");
+      break;
+    }
   }
 
   void
@@ -1712,24 +1798,18 @@ public:
 
 #pragma endregion
 
-  void PromoteFlush() {
-    if (cmd_queue.CurrentChunk()->has_no_work_encoded_yet()) {
-      return;
-    }
-    FlushInternal([](auto) {}, []() {}, false);
-  };
-
   void FlushInternal(std::function<void(MTL::CommandBuffer *)> &&beforeCommit,
                      std::function<void(void)> &&onFinished,
                      bool present_) final {
-    ctx.InvalidateCurrentPass();
     cmd_queue.CurrentChunk()->emit(
         [bc = std::move(beforeCommit),
          _ = DestructorWrapper([of = std::move(onFinished)]() { of(); },
                                nullptr)](CommandChunk::context &ctx) {
           bc(ctx.cmdbuf);
         });
-    ctx.Commit();
+    if (!ctx.InvalidateCurrentPass()) {
+      ctx.Commit();
+    }
     if (present_) {
       cmd_queue.PresentBoundary();
     }
@@ -1752,7 +1832,7 @@ public:
 
   virtual void WaitUntilGPUIdle() override {
     uint64_t seq = cmd_queue.CurrentSeqId();
-    Flush();
+    FlushInternal([](auto) {}, []() {}, false);
     cmd_queue.WaitCPUFence(seq);
   };
 };

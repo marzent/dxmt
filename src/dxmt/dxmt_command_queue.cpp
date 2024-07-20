@@ -2,6 +2,7 @@
 #include "Metal/MTLCaptureManager.hpp"
 #include "Metal/MTLFunctionLog.hpp"
 #include "Foundation/NSAutoreleasePool.hpp"
+#include "dxmt_clear_command.hpp"
 #include "util_env.hpp"
 #include <atomic>
 
@@ -28,7 +29,12 @@ ENCODER_INFO *CommandChunk::mark_pass(EncoderKind kind) {
 CommandQueue::CommandQueue(MTL::Device *device)
     : encodeThread([this]() { this->EncodingThread(); }),
       finishThread([this]() { this->WaitForFinishThread(); }),
-      staging_allocator(device) {
+      staging_allocator(device, MTL::ResourceOptionCPUCacheModeWriteCombined |
+                                    MTL::ResourceHazardTrackingModeUntracked |
+                                    MTL::ResourceStorageModeShared),
+      copy_temp_allocator(device, MTL::ResourceHazardTrackingModeUntracked |
+                                      MTL::ResourceStorageModePrivate),
+      clear_cmd(device) {
   commandQueue = transfer(device->newCommandQueue(kCommandChunkCount));
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
@@ -158,13 +164,13 @@ uint32_t CommandQueue::WaitForFinishThread() {
       chunk.attached_cmdbuf->waitUntilCompleted();
     }
     if (chunk.attached_cmdbuf->status() == MTL::CommandBufferStatusError) {
-      ERR("Device error at frame ", internal_seq, ", : ",
+      ERR("Device error at frame ", chunk.frame_, ", : ",
           chunk.attached_cmdbuf->error()->localizedDescription()->cString(
               NS::ASCIIStringEncoding));
     }
     if (chunk.attached_cmdbuf->logs()) {
       if (((NS::Array *)chunk.attached_cmdbuf->logs())->count()) {
-        ERR("logs at frame ", internal_seq);
+        ERR("logs at frame ", chunk.frame_);
         ERR(chunk.attached_cmdbuf->logs()->debugDescription()->cString(
             NS::ASCIIStringEncoding));
       }

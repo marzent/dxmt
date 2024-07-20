@@ -463,11 +463,12 @@ public:
           return;
         EmitBlitCommand<true>([src_ = src->UseBindable(currentChunkId),
                                dst = Obj(dst_bind.Buffer), DstX, SrcBox](
-                                  MTL::BlitCommandEncoder *encoder, auto ctx) {
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto src = src_.buffer();
           encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
                                   SrcBox.right - SrcBox.left);
         });
+        promote_flush = true;
       } else {
         D3D11_ASSERT(0 && "todo");
       }
@@ -484,7 +485,7 @@ public:
           return;
         EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
                                src = Obj(src_bind.Buffer), DstX, SrcBox](
-                                  MTL::BlitCommandEncoder *encoder, auto ctx) {
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto dst = dst_.buffer();
           // FIXME: offste should be calculated from SrcBox
           encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
@@ -495,7 +496,7 @@ public:
         EmitBlitCommand<true>(
             [dst_ = dst->UseBindable(currentChunkId),
              src_ = src->UseBindable(currentChunkId), DstX,
-             SrcBox](MTL::BlitCommandEncoder *encoder, auto ctx) {
+             SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
               auto src = src_.buffer();
               auto dst = dst_.buffer();
               encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
@@ -519,7 +520,7 @@ public:
           return;
         EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId).buffer(),
                                src = Obj(src_bind.Buffer), DstX, SrcBox](
-                                  MTL::BlitCommandEncoder *encoder, auto ctx) {
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto dst = dst_;
           // FIXME: offste should be calculated from SrcBox
           encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
@@ -530,7 +531,7 @@ public:
         EmitBlitCommand<true>(
             [dst_ = dst->UseBindable(currentChunkId).buffer(),
              src_ = src->UseBindable(currentChunkId), DstX,
-             SrcBox](MTL::BlitCommandEncoder *encoder, auto ctx) {
+             SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
               auto src = src_.buffer();
               auto dst = dst_;
               encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
@@ -578,7 +579,7 @@ public:
         EmitBlitCommand<true>([src_ = src->UseBindable(currentChunkId),
                                dst = Obj(dst_bind.Buffer), bytes_per_row,
                                SrcSubresource, DstX, SrcBox](
-                                  MTL::BlitCommandEncoder *encoder, auto ctx) {
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto src = src_.texture(&ctx);
           auto src_mips = src->mipmapLevelCount();
           auto src_level = SrcSubresource % src_mips;
@@ -590,6 +591,7 @@ public:
               /* offset */ 0, bytes_per_row, 0);
           // offset should be DstX*BytesPerTexel
         });
+        promote_flush = true;
       } else {
         D3D11_ASSERT(0 && "todo");
       }
@@ -607,7 +609,7 @@ public:
         EmitBlitCommand<true>(
             [dst_ = dst->UseBindable(currentChunkId),
              src = Obj(src_bind.Buffer), bytes_per_row, DstSubresource, DstX,
-             DstY, DstZ, SrcBox](MTL::BlitCommandEncoder *encoder, auto ctx) {
+             DstY, DstZ, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
               auto dst = dst_.texture(&ctx);
               auto dst_mips = dst->mipmapLevelCount();
               auto dst_level = DstSubresource % dst_mips;
@@ -624,7 +626,7 @@ public:
                                src_ = src->UseBindable(currentChunkId),
                                DstSubresource, SrcSubresource, DstX, DstY, DstZ,
                                SrcBox](MTL::BlitCommandEncoder *encoder,
-                                       auto ctx) {
+                                       auto &ctx) {
           auto src = src_.texture(&ctx);
           auto dst = dst_.texture(&ctx);
           auto src_mips = src->mipmapLevelCount();
@@ -633,6 +635,12 @@ public:
           auto dst_mips = dst->mipmapLevelCount();
           auto dst_level = DstSubresource % dst_mips;
           auto dst_slice = DstSubresource / dst_mips;
+          if (Forget_sRGB(src->pixelFormat()) !=
+              Forget_sRGB(dst->pixelFormat())) {
+            ERR("Texture1D format mismatch! src: ", src->pixelFormat(),
+                ", dst ", dst->pixelFormat());
+            return;
+          }
           encoder->copyFromTexture(
               src, src_slice, src_level, MTL::Origin::Make(SrcBox.left, 0, 0),
               MTL::Size::Make(SrcBox.right - SrcBox.left, 1, 1), dst, dst_slice,
@@ -696,7 +704,7 @@ public:
         EmitBlitCommand<true>(
             [src_ = src->UseBindable(currentChunkId),
              dst = Obj(dst_bind.Buffer), bytes_per_row, SrcSubresource, DstX,
-             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto ctx) {
+             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
               auto src = src_.texture(&ctx);
               auto src_mips = src->mipmapLevelCount();
               auto src_level = SrcSubresource % src_mips;
@@ -711,6 +719,7 @@ public:
                   dst.ptr(), /* offset */ 0, bytes_per_row, 0);
               // offset should be DstY*bytes_per_row + DstX*BytesPerTexel
             });
+        promote_flush = true;
       } else {
         D3D11_ASSERT(0 && "todo");
       }
@@ -731,7 +740,7 @@ public:
         EmitBlitCommand<true>(
             [dst_ = dst->UseBindable(currentChunkId),
              src = Obj(src_bind.Buffer), bytes_per_row, DstSubresource, DstX,
-             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto ctx) {
+             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
               auto dst = dst_.texture(&ctx);
               auto dst_mips = dst->mipmapLevelCount();
               auto dst_level = DstSubresource % dst_mips;
@@ -750,16 +759,45 @@ public:
         EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
                                src_ = src->UseBindable(currentChunkId),
                                DstSubresource, SrcSubresource, DstX, DstY, DstZ,
-                               SrcBox](MTL::BlitCommandEncoder *encoder,
-                                       auto ctx) {
+                               SrcBox, currentChunkId](
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto src = src_.texture(&ctx);
           auto dst = dst_.texture(&ctx);
           auto src_mips = src->mipmapLevelCount();
+          auto src_format = src->pixelFormat();
           auto src_level = SrcSubresource % src_mips;
           auto src_slice = SrcSubresource / src_mips;
           auto dst_mips = dst->mipmapLevelCount();
           auto dst_level = DstSubresource % dst_mips;
           auto dst_slice = DstSubresource / dst_mips;
+          auto dst_format = dst->pixelFormat();
+          if (Forget_sRGB(dst_format) != Forget_sRGB(src_format)) {
+            if (IsBlockCompressionFormat(dst_format) &&
+                FormatBytesPerTexel(src_format) ==
+                    FormatBytesPerTexel(dst_format)) {
+              auto bytes_per_row = (SrcBox.right - SrcBox.left) *
+                                   FormatBytesPerTexel(src_format);
+              auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
+                  currentChunkId, bytes_per_row * (SrcBox.bottom - SrcBox.top),
+                  16);
+              encoder->copyFromTexture(
+                  src, src_slice, src_level,
+                  MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
+                  MTL::Size::Make(SrcBox.right - SrcBox.left,
+                                  SrcBox.bottom - SrcBox.top, 1),
+                  buffer, offset, bytes_per_row, 0);
+              encoder->copyFromBuffer(
+                  buffer, offset, bytes_per_row, 0,
+                  MTL::Size::Make((SrcBox.right - SrcBox.left) * 4,
+                                  (SrcBox.bottom - SrcBox.top) * 4, 1),
+                  dst, dst_slice, dst_level,
+                  MTL::Origin::Make(DstX, DstY, DstZ));
+              return;
+            }
+            ERR("Texture2D format mismatch! src: ", src_format, ", dst ",
+                dst_format);
+            return;
+          }
           encoder->copyFromTexture(
               src, src_slice, src_level,
               MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
@@ -779,14 +817,17 @@ public:
 
 #pragma region CommandEncoder Maintain State
 
+  bool promote_flush = false;
+
   /**
   Render pass can be invalidated by reasons:
   - render target changes (including depth stencil)
   All pass can be invalidated by reasons:
   - a encoder type switch
   - flush/present
+  Return value indicates if a commit happens
   */
-  void InvalidateCurrentPass() {
+  bool InvalidateCurrentPass() {
     CommandChunk *chk = cmd_queue.CurrentChunk();
     switch (cmdbuf_state) {
     case CommandBufferState::Idle:
@@ -817,6 +858,13 @@ public:
     }
 
     cmdbuf_state = CommandBufferState::Idle;
+    if (promote_flush) {
+      promote_flush = false;
+      Commit();
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -1820,6 +1868,20 @@ public:
     }
   };
 
+  template <bool Force = false, typename Fn>
+  void EmitComputeCommandChk(Fn &&fn) {
+    if (Force) {
+      SwitchToComputeEncoder();
+    }
+    if (cmdbuf_state == CommandBufferState::ComputeEncoderActive ||
+        cmdbuf_state == CommandBufferState::ComputePipelineReady) {
+      CommandChunk *chk = cmd_queue.CurrentChunk();
+      chk->emit([fn = std::forward<Fn>(fn)](CommandChunk::context &ctx) {
+        std::invoke(fn, ctx.compute_encoder.ptr(), ctx);
+      });
+    }
+  };
+
   template <bool Force = false, typename Fn> void EmitBlitCommand(Fn &&fn) {
     if (Force) {
       SwitchToBlitEncoder();
@@ -1893,8 +1955,9 @@ public:
       });
     }
     state_.StreamOutput.Targets.clear_dirty(0);
-    if(state_.StreamOutput.Targets.any_dirty()) {
-      ERR("UpdateSOTargets: non-zero slot is marked dirty but not bound, expect problem");
+    if (state_.StreamOutput.Targets.any_dirty()) {
+      ERR("UpdateSOTargets: non-zero slot is marked dirty but not bound, "
+          "expect problem");
     }
   }
 

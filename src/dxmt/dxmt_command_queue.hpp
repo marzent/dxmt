@@ -9,8 +9,9 @@
 #include "Metal/MTLDevice.hpp"
 #include "Metal/MTLTypes.hpp"
 #include "dxmt_binding.hpp"
+#include "dxmt_clear_command.hpp"
 #include "dxmt_occlusion_query.hpp"
-#include "dxmt_staging_allocator.hpp"
+#include "dxmt_ring_bump_allocator.hpp"
 #include "log/log.hpp"
 #include "objc_pointer.hpp"
 // #include "thread.hpp"
@@ -153,6 +154,7 @@ class CommandChunk {
   class context_t : public EncodingContext {
   public:
     CommandChunk *chk;
+    CommandQueue *queue;
     MTL::CommandBuffer *cmdbuf;
     Obj<MTL::RenderCommandEncoder> render_encoder;
     Obj<MTL::ComputeCommandEncoder> compute_encoder;
@@ -164,7 +166,7 @@ class CommandChunk {
     bool dsv_valid = false;
 
     context_t(CommandChunk *chk, MTL::CommandBuffer *cmdbuf)
-        : chk(chk), cmdbuf(cmdbuf) {}
+        : chk(chk), queue(chk->queue), cmdbuf(cmdbuf) {}
 
   private:
   };
@@ -329,9 +331,12 @@ private:
   std::vector<VisibilityResultObserver *> visibility_result_observers;
   dxmt::mutex mutex_observers;
 
-  StagingAllocator staging_allocator;
+  RingBumpAllocator<true> staging_allocator;
+  RingBumpAllocator<false> copy_temp_allocator;
 
 public:
+  ClearCommandContext clear_cmd;
+
   CommandQueue(MTL::Device *device);
 
   ~CommandQueue();
@@ -379,15 +384,19 @@ public:
     }
   };
 
-  void YieldUntilCoherenceBoundaryUpdate() {
-    cpu_coherent.wait(cpu_coherent.load(std::memory_order_acquire),
-                      std::memory_order_acquire);
+  void FIXME_YieldUntilCoherenceBoundaryUpdate(uint64_t seq_id) {
+    cpu_coherent.wait(seq_id, std::memory_order_acquire);
   };
 
   std::tuple<void *, MTL::Buffer *, uint64_t>
   AllocateStagingBuffer(size_t size, size_t alignment) {
     return staging_allocator.allocate(ready_for_encode, cpu_coherent, size,
                                       alignment);
+  }
+
+  std::tuple<void *, MTL::Buffer *, uint64_t>
+  AllocateTempBuffer(uint64_t seq, size_t size, size_t alignment) {
+    return copy_temp_allocator.allocate(seq, cpu_coherent, size, alignment);
   }
 };
 
