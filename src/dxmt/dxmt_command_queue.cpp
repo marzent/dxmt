@@ -6,6 +6,8 @@
 #include "util_env.hpp"
 #include <atomic>
 
+#define SYNC_ENCODING 1
+
 namespace dxmt {
 
 ENCODER_CLEARPASS_INFO *CommandChunk::mark_clear_pass() {
@@ -84,8 +86,9 @@ void CommandQueue::CommitCurrentChunk(uint64_t occlusion_counter_begin,
   ready_for_encode.fetch_add(1, std::memory_order_release);
   ready_for_encode.notify_all();
 #else
-  CommitChunkInternal(chunk);
-  ready_for_encode.fetch_add(1, std::memory_order_release);
+  CommitChunkInternal(chunk, 
+    ready_for_encode.fetch_add(1, std::memory_order_release)
+  );
 #endif
 }
 
