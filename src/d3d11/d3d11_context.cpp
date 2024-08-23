@@ -86,9 +86,6 @@ auto to_metal_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
   }
 }
 
-using MTLD3D11DeviceContextBase =
-    MTLD3D11DeviceChild<IMTLD3D11DeviceContext, IMTLDynamicBufferExchange>;
-
 class MTLD3D11DeviceContext : public MTLD3D11DeviceContextBase {
 public:
   HRESULT QueryInterface(REFIID riid, void **ppvObject) override {
@@ -101,6 +98,8 @@ public:
         riid == __uuidof(ID3D11DeviceContext) ||
         riid == __uuidof(ID3D11DeviceContext1) ||
         riid == __uuidof(ID3D11DeviceContext2) ||
+        riid == __uuidof(ID3D11DeviceContext3) ||
+        riid == __uuidof(ID3D11DeviceContext4) ||
         riid == __uuidof(IMTLD3D11DeviceContext)) {
       *ppvObject = ref(this);
       return S_OK;
@@ -179,7 +178,9 @@ public:
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_EVENT: {
-      return ((IMTLD3DEventQuery *)pAsync)->GetData(cmd_queue.CoherentSeqId());
+      BOOL null_data;
+      BOOL *data_ptr = pData ? (BOOL *)pData : &null_data;
+      return ((IMTLD3DEventQuery *)pAsync)->GetData(data_ptr, cmd_queue.CoherentSeqId());
     }
     case D3D11_QUERY_OCCLUSION: {
       uint64_t null_data;
@@ -415,8 +416,43 @@ public:
   void ResolveSubresource(ID3D11Resource *pDstResource, UINT DstSubresource,
                           ID3D11Resource *pSrcResource, UINT SrcSubresource,
                           DXGI_FORMAT Format) override {
-    // Metal does not provide methods for explicit resolve action.
-    IMPLEMENT_ME
+    D3D11_RESOURCE_DIMENSION dimension;
+    pDstResource->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+      return;
+    pSrcResource->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+      return;
+    D3D11_TEXTURE2D_DESC desc;
+    uint32_t width, height;
+    ((ID3D11Texture2D *)pSrcResource)->GetDesc(&desc);
+    if (desc.SampleDesc.Count < 2) {
+      ERR("ResolveSubresource: Source is not multisampled ", desc.SampleDesc.Count);
+      return;
+    }
+    if (desc.ArraySize <= DstSubresource) {
+      return;
+    }
+    width = desc.Width;
+    height = desc.Height;
+    ((ID3D11Texture2D *)pDstResource)->GetDesc(&desc);
+    if (desc.SampleDesc.Count > 1) {
+      ERR("ResolveSubresource: Destination is not valid resolve target");
+      return;
+    }
+    uint32_t dst_level = DstSubresource % desc.MipLevels;
+    uint32_t dst_slice = DstSubresource / desc.MipLevels;
+    if (width != std::max(1u, desc.Width >> dst_level) ||
+        height != std::max(1u, desc.Height >> dst_level)) {
+      ERR("ResolveSubresource: Size doesn't match");
+      return;
+    }
+    if (auto dst = com_cast<IMTLBindable>(pDstResource)) {
+      if (auto src = com_cast<IMTLBindable>(pSrcResource)) {
+        ctx.ResolveSubresource(src.ptr(), SrcSubresource, dst.ptr(), dst_level,
+                               dst_slice);
+      }
+    }
   }
 
   void CopyResource(ID3D11Resource *pDstResource,
@@ -1552,8 +1588,8 @@ public:
                        const FLOAT BlendFactor[4], UINT SampleMask) override {
     bool should_invalidate_pipeline = false;
     if (auto expected = com_cast<IMTLD3D11BlendState>(pBlendState)) {
-      if (expected.ptr() != state_.OutputMerger.BlendState.ptr()) {
-        state_.OutputMerger.BlendState = std::move(expected);
+      if (expected.ptr() != state_.OutputMerger.BlendState) {
+        state_.OutputMerger.BlendState = expected.ptr();
         should_invalidate_pipeline = true;
       }
       if (BlendFactor) {
@@ -1564,7 +1600,10 @@ public:
         state_.OutputMerger.BlendFactor[2] = 1.0f;
         state_.OutputMerger.BlendFactor[3] = 1.0f;
       }
+    }
+    if(state_.OutputMerger.SampleMask != SampleMask) {
       state_.OutputMerger.SampleMask = SampleMask;
+      should_invalidate_pipeline = true;
     }
     if (should_invalidate_pipeline) {
       ctx.InvalidateRenderPipeline();
@@ -1574,7 +1613,7 @@ public:
   void OMGetBlendState(ID3D11BlendState **ppBlendState, FLOAT BlendFactor[4],
                        UINT *pSampleMask) override {
     if (ppBlendState) {
-      *ppBlendState = state_.OutputMerger.BlendState.ref();
+      state_.OutputMerger.BlendState->QueryInterface(IID_PPV_ARGS(ppBlendState));
     }
     if (BlendFactor) {
       memcpy(BlendFactor, state_.OutputMerger.BlendFactor, sizeof(float[4]));
@@ -1588,7 +1627,7 @@ public:
                               UINT StencilRef) override {
     if (auto expected =
             com_cast<IMTLD3D11DepthStencilState>(pDepthStencilState)) {
-      state_.OutputMerger.DepthStencilState = std::move(expected);
+      state_.OutputMerger.DepthStencilState = expected.ptr();
       state_.OutputMerger.StencilRef = StencilRef;
       ctx.dirty_state.set(ContextInternal::DirtyState::DepthStencilState);
     }
@@ -1597,7 +1636,8 @@ public:
   void OMGetDepthStencilState(ID3D11DepthStencilState **ppDepthStencilState,
                               UINT *pStencilRef) override {
     if (ppDepthStencilState) {
-      *ppDepthStencilState = state_.OutputMerger.DepthStencilState.ref();
+      state_.OutputMerger.DepthStencilState->QueryInterface(
+          IID_PPV_ARGS(ppDepthStencilState));
     }
     if (pStencilRef) {
       *pStencilRef = state_.OutputMerger.StencilRef;
@@ -1612,16 +1652,16 @@ public:
     if (pRasterizerState) {
       if (auto expected =
               com_cast<IMTLD3D11RasterizerState>(pRasterizerState)) {
-        auto &current_rs = state_.Rasterizer.RasterizerState
+        auto current_rs = state_.Rasterizer.RasterizerState
                                ? state_.Rasterizer.RasterizerState
                                : ctx.default_rasterizer_state;
-        if (current_rs == expected) {
+        if (current_rs == expected.ptr()) {
           return;
         }
         if (current_rs->IsScissorEnabled() != expected->IsScissorEnabled()) {
           ctx.dirty_state.set(ContextInternal::DirtyState::Scissors);
         }
-        state_.Rasterizer.RasterizerState = expected;
+        state_.Rasterizer.RasterizerState = expected.ptr();
         ctx.dirty_state.set(ContextInternal::DirtyState::RasterizerState);
       } else {
         ERR("RSSetState: invalid ID3D11RasterizerState object.");
@@ -1663,9 +1703,9 @@ public:
       state_.Rasterizer.viewports[i] = pViewports[i];
     }
     ctx.dirty_state.set(ContextInternal::DirtyState::Viewport);
-    auto &current_rs = state_.Rasterizer.RasterizerState
-                           ? state_.Rasterizer.RasterizerState
-                           : ctx.default_rasterizer_state;
+    IMTLD3D11RasterizerState *current_rs =
+        state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState
+                                          : ctx.default_rasterizer_state;
     if (!current_rs->IsScissorEnabled()) {
       ctx.dirty_state.set(ContextInternal::DirtyState::Scissors);
     }
@@ -1695,9 +1735,10 @@ public:
     for (unsigned i = 0; i < NumRects; i++) {
       state_.Rasterizer.scissor_rects[i] = pRects[i];
     }
-    auto &current_rs = state_.Rasterizer.RasterizerState
-                           ? state_.Rasterizer.RasterizerState
-                           : ctx.default_rasterizer_state;
+    IMTLD3D11RasterizerState *current_rs =
+        state_.Rasterizer.RasterizerState
+            ? state_.Rasterizer.RasterizerState
+            : ctx.default_rasterizer_state;
     if (current_rs->IsScissorEnabled()) {
       ctx.dirty_state.set(ContextInternal::DirtyState::Scissors);
       // otherwise no need to update scissor because it's either already dirty
@@ -1800,6 +1841,34 @@ public:
 
 #pragma endregion
 
+#pragma region 11.3
+
+  void STDMETHODCALLTYPE Flush1(D3D11_CONTEXT_TYPE type,
+                                HANDLE event) override {
+    IMPLEMENT_ME;
+  }
+
+  void STDMETHODCALLTYPE SetHardwareProtectionState(WINBOOL enable) override {
+    WARN("SetHardwareProtectionState: stub");
+  }
+
+  void STDMETHODCALLTYPE GetHardwareProtectionState(WINBOOL *enable) override {
+    *enable = false;
+    WARN("GetHardwareProtectionState: stub");
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE Signal(ID3D11Fence *fence,
+                                           UINT64 value) override {
+    IMPLEMENT_ME
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE Wait(ID3D11Fence *fence,
+                                         UINT64 value) override {
+    IMPLEMENT_ME
+  }
+
+#pragma endregion
+
   void FlushInternal(std::function<void(MTL::CommandBuffer *)> &&beforeCommit,
                      std::function<void(void)> &&onFinished,
                      bool present_) final {
@@ -1838,8 +1907,9 @@ public:
   };
 };
 
-Com<IMTLD3D11DeviceContext> CreateD3D11DeviceContext(IMTLD3D11Device *pDevice) {
-  return new MTLD3D11DeviceContext(pDevice);
+std::unique_ptr<MTLD3D11DeviceContextBase>
+InitializeImmediateContext(IMTLD3D11Device *pDevice) {
+  return std::make_unique<MTLD3D11DeviceContext>(pDevice);
 }
 
 } // namespace dxmt

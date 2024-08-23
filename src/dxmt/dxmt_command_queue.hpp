@@ -9,13 +9,12 @@
 #include "Metal/MTLDevice.hpp"
 #include "Metal/MTLTypes.hpp"
 #include "dxmt_binding.hpp"
-#include "dxmt_clear_command.hpp"
+#include "dxmt_command.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "log/log.hpp"
 #include "objc_pointer.hpp"
-// #include "thread.hpp"
-#include <thread>
+#include "thread.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -24,7 +23,7 @@
 
 namespace dxmt {
 
-enum class EncoderKind : uint32_t { Nil, ClearPass, Render, Compute, Blit };
+enum class EncoderKind : uint32_t { Nil, ClearPass, Render, Compute, Blit, Resolve };
 
 struct ENCODER_INFO {
   EncoderKind kind;
@@ -317,12 +316,8 @@ private:
   uint64_t encoder_seq = 1;
   uint64_t present_seq = 0;
 
-  /**
-  FIXME: dxmt::thread cause access page fault when
-  program shutdown. recheck this later
-  */
-  std::thread encodeThread;
-  std::thread finishThread;
+  dxmt::thread encodeThread;
+  dxmt::thread finishThread;
   Obj<MTL::CommandQueue> commandQueue;
 
   friend class CommandChunk;
@@ -335,7 +330,7 @@ private:
   RingBumpAllocator<false> copy_temp_allocator;
 
 public:
-  ClearCommandContext clear_cmd;
+  DXMTCommandContext clear_cmd;
 
   CommandQueue(MTL::Device *device);
 

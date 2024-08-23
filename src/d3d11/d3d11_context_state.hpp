@@ -49,7 +49,7 @@ template <> struct redunant_binding_trait<CONSTANT_BUFFER_B> {
 
 struct SAMPLER_B {
   IUnknown *RawPointer = 0;
-  Com<IMTLD3D11SamplerState> Sampler;
+  IMTLD3D11SamplerState* Sampler;
 };
 
 typedef BindingSet<SAMPLER_B, 16> SamplerBindingSet;
@@ -114,15 +114,13 @@ struct D3D11OutputMergerStageState {
 
   UAVBindingSet UAVs;
 
-  Com<IMTLD3D11DepthStencilState> DepthStencilState;
+  IMTLD3D11DepthStencilState* DepthStencilState;
   UINT StencilRef;
 
-  Com<IMTLD3D11BlendState> BlendState;
+  IMTLD3D11BlendState* BlendState;
   FLOAT BlendFactor[4];
 
-  // See https://github.com/gpuweb/gpuweb/issues/267
-  // Currently ignored, should be able to emulate it as AND operation in shader
-  UINT SampleMask;
+  UINT SampleMask = 0xffffffff;
 };
 
 struct STREAM_OUTPUT_BUFFER_B {
@@ -150,7 +148,7 @@ struct D3D11RasterizerStageState {
   viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {{}};
   UINT NumScissorRects;
   UINT NumViewports;
-  Com<IMTLD3D11RasterizerState> RasterizerState;
+  IMTLD3D11RasterizerState* RasterizerState;
 };
 
 struct D3D11ContextState {

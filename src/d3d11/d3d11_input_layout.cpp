@@ -41,6 +41,9 @@ public:
         attributes_(attributes), layouts_(layouts), sign_mask_(sign_mask),
         input_slot_mask_(input_slot_mask) {}
 
+  ~MTLD3D11InputLayout() {
+  }
+
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
     if (ppvObject == nullptr)
@@ -208,11 +211,13 @@ HRESULT CreateInputLayout(IMTLD3D11Device *device,
     if (desc.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT) {
       Attribute last_attr_in_same_slot = {
           .slot = 0xffffffff, .offset = 0, .element_stride = 0};
-      for (signed j = i - 1; j >= 0; j--) {
-        if (elements[j].slot == //
-            attribute.slot) {
-          last_attr_in_same_slot = elements[j];
-          break;
+      if (attributeCount > 1) {
+        for (signed j = attributeCount - 2; j >= 0; j--) {
+          if (elements[j].slot == //
+              attribute.slot) {
+            last_attr_in_same_slot = elements[j];
+            break;
+          }
         }
       }
       uint32_t unaligned_offset =

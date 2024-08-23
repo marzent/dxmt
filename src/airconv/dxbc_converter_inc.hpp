@@ -86,6 +86,7 @@ struct io_binding_map {
   llvm::Value *thread_group_id_arg = nullptr;
   llvm::Value *thread_id_in_group_arg = nullptr;
   llvm::Value *thread_id_in_group_flat_arg = nullptr;
+  llvm::Value *coverage_mask_arg = nullptr;
 
   // special registers (output)
   llvm::AllocaInst *depth_output_reg = nullptr;
@@ -102,6 +103,7 @@ struct context {
   llvm::Function *function;
   io_binding_map &resource;
   air::AirType &types; // hmmm
+  uint32_t pso_sample_mask;
 };
 
 template <typename T = std::monostate>
@@ -1778,9 +1780,9 @@ IRValue call_calc_lod(
   auto op_info = co_yield get_operation_info(texture_type);
   assert(!op_info.is_ms);
   assert(!op_info.is_1d_or_1d_array);
-  auto fn_name = is_unclamped
-                   ? "air.calculate_unclamped_lod_"
-                   : "air.calculate_clamped_lod_" + op_info.air_symbol_suffix;
+  auto fn_name = (is_unclamped ? "air.calculate_unclamped_lod_"
+                               : "air.calculate_clamped_lod_") +
+                 op_info.air_symbol_suffix;
   std::vector<llvm::Type *> args_type;
   std::vector<pvalue> args_value;
 
@@ -2292,6 +2294,7 @@ uint32_t get_dst_mask(DstOperand dst) {
       [](DstOperandTemp dst) { return dst._.mask; },
       [](DstOperandIndexableTemp dst) { return dst._.mask; },
       [](DstOperandOutputDepth) { return (uint32_t)1; },
+      [](DstOperandOutputCoverageMask) { return (uint32_t)1; },
       [](auto s) {
         llvm::outs() << "get_dst_mask: unhandled dst operand type "
                      << decltype(s)::debug_name << "\n";
@@ -2521,6 +2524,17 @@ IRValue load_src<SrcOperandAttribute, false>(SrcOperandAttribute attr) {
   case shader::common::InputAttribute::ThreadIdInGroupFlatten: {
     assert(ctx.resource.thread_id_in_group_flat_arg);
     vec = co_yield extend_to_vec4(ctx.resource.thread_id_in_group_flat_arg);
+    break;
+  }
+  case shader::common::InputAttribute::CoverageMask: {
+    assert(ctx.resource.coverage_mask_arg);
+    vec = co_yield extend_to_vec4(
+      ctx.pso_sample_mask != 0xffffffff
+        ? ctx.builder.CreateAnd(
+            ctx.resource.coverage_mask_arg, ctx.pso_sample_mask
+          )
+        : ctx.resource.coverage_mask_arg
+    );
     break;
   }
   }
@@ -2780,6 +2794,46 @@ store_dst<DstOperandOutputDepth, true>(DstOperandOutputDepth, IRValue &&value) {
         ctx.types._float, ctx.resource.depth_output_reg, 0
       );
       ctx.builder.CreateStore(depth, ptr);
+      co_return {};
+    }
+  );
+};
+
+template <>
+IREffect store_dst<DstOperandOutputCoverageMask, false>(
+  DstOperandOutputCoverageMask, IRValue &&value
+) {
+  // coroutine + rvalue reference = SHOOT YOURSELF IN THE FOOT
+  return make_effect_bind(
+    [value = std::move(value)](context ctx) mutable -> IREffect {
+      // FIXME: extend_to_vec4 is kinda silly
+      pvalue sample_mask = co_yield (std::move(value) >>= extend_to_vec4) >>=
+        extract_element(0);
+      auto ptr = ctx.builder.CreateConstGEP1_32(
+        ctx.types._int, ctx.resource.coverage_mask_reg, 0
+      );
+      ctx.builder.CreateStore(sample_mask, ptr);
+      co_return {};
+    }
+  );
+};
+
+template <>
+IREffect store_dst<DstOperandOutputCoverageMask, true>(
+  DstOperandOutputCoverageMask, IRValue &&value
+) {
+  // coroutine + rvalue reference = SHOOT YOURSELF IN THE FOOT
+  return make_effect_bind(
+    [value = std::move(value)](context ctx) mutable -> IREffect {
+      // FIXME: extend_to_vec4 is kinda silly
+      pvalue sample_mask = co_yield (std::move(value) >>= extend_to_vec4) >>=
+        extract_element(0);
+      auto ptr = ctx.builder.CreateConstGEP1_32(
+        ctx.types._int, ctx.resource.coverage_mask_reg, 0
+      );
+      ctx.builder.CreateStore(
+        ctx.builder.CreateBitCast(sample_mask, ctx.types._int), ptr
+      );
       co_return {};
     }
   );
@@ -5185,6 +5239,9 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                      pvalue y = nullptr;
                      pvalue z = nullptr;
                      pvalue zero = co_yield get_int(0);
+                     pvalue miplevel =
+                       co_yield load_src_op<false>(resinfo.src_mip_level) >>=
+                       extract_element(0);
                      switch (tex.resource_kind) {
                      case air::TextureKind::texture_1d:
                        x = co_yield call_get_texture_info(
@@ -5204,10 +5261,10 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                      case air::TextureKind::texture_cube:
                      case air::TextureKind::depth_cube:
                        x = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::width, zero
+                         tex, res_h, TextureInfoType::width, miplevel
                        );
                        y = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::height, zero
+                         tex, res_h, TextureInfoType::height, miplevel
                        );
                        break;
                      case air::TextureKind::texture_2d_array:
@@ -5215,10 +5272,10 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                      case air::TextureKind::texture_cube_array:
                      case air::TextureKind::depth_cube_array:
                        x = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::width, zero
+                         tex, res_h, TextureInfoType::width, miplevel
                        );
                        y = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::height, zero
+                         tex, res_h, TextureInfoType::height, miplevel
                        );
                        z = co_yield call_get_texture_info(
                          tex, res_h, TextureInfoType::array_length, zero
@@ -5226,13 +5283,13 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                        break;
                      case air::TextureKind::texture_3d:
                        x = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::width, zero
+                         tex, res_h, TextureInfoType::width, miplevel
                        );
                        y = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::height, zero
+                         tex, res_h, TextureInfoType::height, miplevel
                        );
                        z = co_yield call_get_texture_info(
-                         tex, res_h, TextureInfoType::depth, zero
+                         tex, res_h, TextureInfoType::depth, miplevel
                        );
                        break;
                      case air::TextureKind::texture_buffer: {
@@ -5248,18 +5305,20 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                      pvalue mip_count = co_yield call_get_texture_info(
                        tex, res_h, TextureInfoType::num_mip_levels, zero
                      );
-                     pvalue vec_ret = llvm::PoisonValue::get(ctx.types._int4);
-                     vec_ret =
-                       ctx.builder.CreateInsertElement(vec_ret, mip_count, 3);
+                     pvalue vec_ret = llvm::PoisonValue::get(ctx.types._float4);
+                     vec_ret = ctx.builder.CreateInsertElement(
+                       vec_ret,
+                       co_yield call_convert(
+                         mip_count, ctx.types._float, air::Sign::no_sign
+                       ),
+                       3
+                     );
                      switch (resinfo.modifier) {
                      case InstResourceInfo::M::none: {
                        auto to_float_cast = [&](pvalue v) -> IRValue {
-                         co_return ctx.builder.CreateBitCast(
-                           co_yield call_convert(
-                             v, ctx.types._float, air::Sign::no_sign
-                           ),
-                           ctx.types._int
-                         );
+                         co_return (co_yield call_convert(
+                           v, ctx.types._float, air::Sign::no_sign
+                         ));
                        };
                        x = co_yield to_float_cast(x ? x : zero);
                        y = co_yield to_float_cast(y ? y : zero);
@@ -5267,22 +5326,25 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                        break;
                      }
                      case InstResourceInfo::M::uint: {
-                       x = x ? x : zero;
-                       y = y ? y : zero;
-                       z = z ? z : zero;
+                       x = ctx.builder.CreateBitCast(
+                         x ? x : zero, ctx.types._float
+                       );
+                       y = ctx.builder.CreateBitCast(
+                         y ? y : zero, ctx.types._float
+                       );
+                       z = ctx.builder.CreateBitCast(
+                         z ? z : zero, ctx.types._float
+                       );
                        break;
                      }
                      case InstResourceInfo::M::rcp: {
                        auto to_rcp_cast = [&](pvalue v) -> IRValue {
-                         co_return ctx.builder.CreateBitCast(
-                           ctx.builder.CreateFDiv(
-                             co_yield get_float(1.0f),
-                             co_yield call_convert(
-                               v, ctx.types._float, air::Sign::no_sign
-                             )
-                           ),
-                           ctx.types._int
-                         );
+                         co_return (ctx.builder.CreateFDiv(
+                           co_yield get_float(1.0f),
+                           co_yield call_convert(
+                             v, ctx.types._float, air::Sign::no_sign
+                           )
+                         ));
                        };
                        x = co_yield to_rcp_cast(x ? x : zero);
                        y = co_yield to_rcp_cast(y ? y : zero);
@@ -5295,7 +5357,7 @@ llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
                        ctx.builder.CreateInsertElement(vec_ret, x, (uint64_t)0);
                      vec_ret = ctx.builder.CreateInsertElement(vec_ret, y, 1);
                      vec_ret = ctx.builder.CreateInsertElement(vec_ret, z, 2);
-                     co_return co_yield store_dst_op<false>(
+                     co_return co_yield store_dst_op<true>(
                        resinfo.dst, pure(vec_ret) >>= swizzle(swiz)
                      );
                    });
