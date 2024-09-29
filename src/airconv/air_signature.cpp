@@ -323,7 +323,7 @@ auto insert_inteterpolation(StreamMDHelper &md, Interpolation interpolation) {
 
 auto ArgumentBufferBuilder::Build(
   llvm::LLVMContext &context, const llvm::DataLayout &layout
-) -> std::tuple<llvm::StructType *, llvm::MDNode *> {
+) const -> std::tuple<llvm::StructType *, llvm::MDNode *> {
   std::vector<llvm::Type *> fields;
   std::vector<llvm::Metadata *> indirect_argument;
   uint32_t offset = 0;
@@ -417,10 +417,26 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
                 return s.user ==
                        std::get<InputFragmentStageIn>(element.value()).user;
               },
-              [&](const ArgumentBindingBuffer s) { return false; },
-              [&](const ArgumentBindingSampler s) { return false; },
-              [&](const ArgumentBindingTexture s) { return false; },
-              [&](const ArgumentBindingIndirectBuffer s) { return false; },
+              [&](const ArgumentBindingBuffer s) {
+                return s.location_index ==
+                       std::get<ArgumentBindingBuffer>(element.value())
+                         .location_index;
+              },
+              [&](const ArgumentBindingSampler s) {
+                return s.location_index ==
+                       std::get<ArgumentBindingSampler>(element.value())
+                         .location_index;
+              },
+              [&](const ArgumentBindingTexture s) {
+                return s.location_index ==
+                       std::get<ArgumentBindingTexture>(element.value())
+                         .location_index;
+              },
+              [&](const ArgumentBindingIndirectBuffer s) {
+                return s.location_index ==
+                       std::get<ArgumentBindingIndirectBuffer>(element.value())
+                         .location_index;
+              },
               [](auto) { return true; }
             },
             input
@@ -435,8 +451,8 @@ uint32_t FunctionSignatureBuilder::DefineInput(const FunctionInput &input) {
 
 uint32_t FunctionSignatureBuilder::DefineOutput(const FunctionOutput &output) {
   uint32_t index = outputs.size();
-  for(uint32_t i = 0; i < index; i++) {
-    if(outputs[i] == output) {
+  for (uint32_t i = 0; i < index; i++) {
+    if (outputs[i] == output) {
       return i;
     }
   }
@@ -602,6 +618,14 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("mtl_thread_index_in_threadgroup");
           return msl_uint.get_llvm_type(context);
         },
+        [&](const InputThreadgroupsPerGrid &) {
+          metadata_field.string("air.threadgroups_per_grid")
+            ->string("air.arg_type_name")
+            ->string("uint3") // HARDCODED
+            ->string("air.arg_name")
+            ->string("mtl_threadgroups_per_grid");
+          return msl_uint3.get_llvm_type(context);
+        },
         [&](const InputVertexID &) {
           metadata_field.string("air.vertex_id")
             ->string("air.arg_type_name")
@@ -650,6 +674,56 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("mtl_sample_mask");
           return msl_uint.get_llvm_type(context);
         },
+        [&](const InputPatchID &) {
+          metadata_field.string("air.patch_id")
+            ->string("air.arg_type_name")
+            ->string("uint") // HARDCODED
+            ->string("air.arg_name")
+            ->string("mtl_patch_id");
+          return msl_uint.get_llvm_type(context);
+        },
+        [&](const InputPositionInPatch &pip) {
+          if (pip.patch == PostTessellationPatch::triangle) {
+            metadata_field.string("air.position_in_patch")
+              ->string("air.arg_type_name")
+              ->string("float3") // HARDCODED
+              ->string("air.arg_name")
+              ->string("mtl_position_in_patch");
+            return msl_float3.get_llvm_type(context);
+          } else {
+            metadata_field.string("air.position_in_patch")
+              ->string("air.arg_type_name")
+              ->string("float2") // HARDCODED
+              ->string("air.arg_name")
+              ->string("mtl_position_in_patch");
+            return msl_float2.get_llvm_type(context);
+          }
+        },
+        [&](const InputPayload &payload) -> llvm::Type * {
+          metadata_field.string("air.payload")
+            ->string("air.arg_type_size")
+            ->integer(payload.size)
+            ->string("air.arg_type_align_size")
+            ->integer(4)
+            ->string("air.arg_type_name")
+            ->string("uint") // HARDCODED
+            ->string("air.arg_name")
+            ->string("mtl_payload");
+          return msl_uint.get_llvm_type(context)->getPointerTo( //
+            (uint32_t)AddressSpace::object_data
+          );
+        },
+        [&](const InputMeshGridProperties &) -> llvm::Type * {
+          metadata_field.string("air.mesh_grid_properties")
+            ->string("air.arg_type_name")
+            ->string("mesh_grid_properties") // HARDCODED
+            ->string("air.arg_name")
+            ->string("mtl_mesh_grid_properties");
+          // will cast it anyway. TODO: get correct type from AirType
+          return msl_uint.get_llvm_type(context)->getPointerTo( //
+            (uint32_t)AddressSpace::threadgroup
+          );
+        },
         [](auto _) {
           assert(0 && "Unhandled input");
           return (llvm::Type *)nullptr;
@@ -678,9 +752,19 @@ auto FunctionSignatureBuilder::CreateFunction(
           return get_llvm_type(vertex_out.type, context);
         },
         [&](const OutputRenderTarget &render_target) {
+          if (render_target.dual_source_blending) {
+            md.string("air.render_target")
+              ->integer(0)
+              ->integer(render_target.index)
+              ->string("air.arg_type_name")
+              ->string(get_name(render_target.type))
+              ->string("air.arg_name")
+              ->string("render_target_" + std::to_string(render_target.index));
+            return get_llvm_type(render_target.type, context);
+          }
           md.string("air.render_target")
             ->integer(render_target.index)
-            ->integer(0) // TODO: dual source blending
+            ->integer(0)
             ->string("air.arg_type_name")
             ->string(get_name(render_target.type))
             ->string("air.arg_name")
@@ -714,7 +798,35 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->string("uint")
             ->string("air.arg_name")
             ->string("mtl_coverage_mask");
-          return (llvm::Type*)Type::getInt32Ty(context);
+          return (llvm::Type *)Type::getInt32Ty(context);
+        },
+        [&](const OutputClipDistance clip_distance) {
+          md.string("air.clip_distance")
+            ->string("air.clip_distance_array_size")
+            ->integer(clip_distance.count)
+            ->string("air.arg_type_name")
+            ->string("float")
+            ->string("air.arg_name")
+            ->string("mtl_clip_distance");
+          return (llvm::Type *)ArrayType::get(
+            Type::getFloatTy(context), clip_distance.count
+          );
+        },
+        [&](const OutputRenderTargetArrayIndex) {
+          md.string("air.render_target_array_index")
+            ->string("air.arg_type_name")
+            ->string("uint")
+            ->string("air.arg_name")
+            ->string("mtl_render_target_array_index");
+          return (llvm::Type *)Type::getInt32Ty(context);
+        },
+        [&](const OutputViewportArrayIndex) {
+          md.string("air.viewport_array_index")
+            ->string("air.arg_type_name")
+            ->string("uint")
+            ->string("air.arg_name")
+            ->string("mtl_viewport_array_index");
+          return (llvm::Type *)Type::getInt32Ty(context);
         },
         [](auto _) {
           assert(0 && "Unhandled output");
@@ -756,6 +868,23 @@ auto FunctionSignatureBuilder::CreateFunction(
              context, "max-work-group-size", std::to_string(max_work_group_size)
            )
     );
+  }
+  if (patch.has_value()) {
+    auto [patch_type, num_control_point] = patch.value();
+    // don't use num_control_point here, as we pull input directly from buffer
+    auto tuple = MDTuple::get(
+      context,
+      {MDString::get(context, "air.patch"),
+       MDString::get(
+         context,
+         patch_type == PostTessellationPatch::triangle ? "triangle" : "quad"
+       ),
+       MDString::get(context, "air.patch_control_point"),
+       ConstantAsMetadata::get(
+         ConstantInt::get(context, APInt{32, 0})
+       )}
+    );
+    function_def_tuple.push_back(tuple);
   }
   return std::make_pair(function, MDTuple::get(context, function_def_tuple));
 };

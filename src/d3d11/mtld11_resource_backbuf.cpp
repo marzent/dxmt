@@ -33,6 +33,7 @@ struct tag_texture_backbuffer {
   using COM_IMPL = ID3D11Texture2D1;
   using DESC = D3D11_TEXTURE2D_DESC;
   using DESC1 = D3D11_TEXTURE2D_DESC1;
+  static constexpr std::string_view debug_name = "backbuffer";
 };
 
 template <bool EnableMetalFX>
@@ -151,6 +152,8 @@ private:
                                   void **ppLogicalResource) override {
       this->QueryInterface(riid, ppLogicalResource);
     };
+
+    virtual uint64_t SwapCounter(uint64_t handle) override { return handle; };
   };
 
 public:

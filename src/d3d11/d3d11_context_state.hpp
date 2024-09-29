@@ -16,7 +16,6 @@ namespace dxmt {
 struct UAV_B {
   IUnknown *RawPointer = 0;
   Com<IMTLBindable> View;
-  UINT InitialCountValue;
 };
 
 typedef BindingSet<UAV_B, 64> UAVBindingSet;
@@ -96,7 +95,7 @@ template <> struct redunant_binding_trait<VERTEX_BUFFER_B> {
 };
 
 struct D3D11InputAssemblerStageState {
-  Com<IMTLD3D11InputLayout> InputLayout;
+  IMTLD3D11InputLayout *InputLayout;
   BindingSet<VERTEX_BUFFER_B, 16> VertexBuffers;
   Com<IMTLBindable> IndexBuffer;
   /**

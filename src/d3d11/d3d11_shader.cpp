@@ -1,5 +1,5 @@
+#include "d3d11_input_layout.hpp"
 #include <atomic>
-#include <fstream>
 #include <string>
 #define __METALCPP__ 1
 #include "d3d11_private.h"
@@ -9,12 +9,14 @@
 #include "d3d11_device_child.hpp"
 #include "objc_pointer.hpp"
 #include "DXBCParser/DXBCUtils.h"
+#include "log/log.hpp"
 
 namespace dxmt {
 
 struct tag_vertex_shader {
   using COM = ID3D11VertexShader;
-  using DATA = void *;
+  using DATA =
+      std::unordered_map<IMTLD3D11InputLayout *, Com<IMTLCompiledShader>>;
 };
 
 struct tag_pixel_shader {
@@ -84,6 +86,27 @@ public:
 #endif
   }
 
+  bool dumped = false;
+
+  void Dump() {
+    if(dumped) {
+      return;
+    }
+#ifdef DXMT_DEBUG
+    std::fstream dump_out;
+    dump_out.open("shader_dump_" + std::to_string(id) + ".cso",
+                  std::ios::out | std::ios::binary);
+    if (dump_out) {
+      dump_out.write((char *)dump, dump_len);
+    }
+    dump_out.close();
+    ERR("dumped to ./shader_dump_" + std::to_string(id) + ".cso");
+#else
+    WARN("shader dump disabled");
+#endif
+    dumped = true;
+  }
+
   HRESULT QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
       return E_POINTER;
@@ -111,16 +134,18 @@ public:
 
   void GetCompiledShader(IMTLCompiledShader **pShader) final;
 
-  void GetCompiledShaderWithInputLayerFixup(uint64_t sign_mask,
-                                            IMTLCompiledShader **pShader) final;
+  uint64_t GetUniqueId() final { return id; }
 
-  virtual void
-  GetCompiledPixelShaderWithSampleMask(uint32_t sample_mask,
-                                       IMTLCompiledShader **ppShader) final;
+  void *GetAirconvHandle() final { return sm50; }
 
-  void GetReflection(MTL_SHADER_REFLECTION **pRefl) final {
-    *pRefl = &reflection;
-  }
+  void GetCompiledVertexShaderWithVertexPulling(IMTLD3D11InputLayout *,
+                                                IMTLCompiledShader **) final;
+
+  virtual void GetCompiledPixelShader(uint32_t sample_mask,
+                                      bool dual_source_blending,
+                                      IMTLCompiledShader **ppShader) final;
+
+  const MTL_SHADER_REFLECTION *GetReflection() final { return &reflection; }
 
   SM50Shader *sm50;
   MTL_SHADER_REFLECTION reflection;
@@ -151,7 +176,7 @@ public:
 
   ~AirconvShader() {}
 
-  void SubmitWork() { device_->SubmitThreadgroupWork(this, &work_state_); }
+  void SubmitWork() { device_->SubmitThreadgroupWork(this); }
 
   HRESULT QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
@@ -168,11 +193,12 @@ public:
     return E_NOINTERFACE;
   }
 
-  bool IsReady() final { return ready_.load(std::memory_order_relaxed); }
-
-  void GetShader(MTL_COMPILED_SHADER *pShaderData) final {
-    ready_.wait(false, std::memory_order_acquire);
-    *pShaderData = {function_.ptr(), &hash_, &shader_->reflection};
+  bool GetShader(MTL_COMPILED_SHADER *pShaderData) final {
+    bool ret = false;
+    if ((ret = ready_.load(std::memory_order_acquire))) {
+      *pShaderData = {function_.ptr(), &hash_};
+    }
+    return ret;
   }
 
   void Dump() {
@@ -190,9 +216,7 @@ public:
 #endif
   }
 
-  uint64_t GetId() { return variant_id; }
-
-  void RunThreadpoolWork() {
+  IMTLThreadpoolWork* RunThreadpoolWork() {
     D3D11_ASSERT(!ready_ && "?wtf"); // TODO: should use a lock?
 
     /**
@@ -221,7 +245,7 @@ public:
           SM50FreeError(sm50_err);
         }
         Dump();
-        return;
+        return this;
       }
       MTL_SHADER_BITCODE bitcode;
       SM50GetCompiledBitcode(compile_result, &bitcode);
@@ -235,7 +259,7 @@ public:
       if (err) {
         ERR("Failed to create MTLLibrary: ",
             err->localizedDescription()->utf8String());
-        return; // FIXME: ready_ always false? should propagate error
+        return this;
       }
 
       dispatch_release(dispatch_data);
@@ -244,7 +268,7 @@ public:
           NS::String::string(func_name.c_str(), NS::UTF8StringEncoding)));
       if (function_ == nullptr) {
         ERR("Failed to create MTLFunction: ", func_name);
-        return;
+        return this;
       }
     }
 
@@ -253,15 +277,21 @@ public:
     /* workaround end: ensure shader bytecode is accessible */
     shader_->Release();
 
-    ready_.store(true);
-    ready_.notify_all();
+    return this;
+  }
+
+  bool GetIsDone() {
+    return ready_;
+  }
+
+  void SetIsDone(bool state) {
+    ready_.store(state);
   }
 
 private:
   IMTLD3D11Device *device_;
   TShaderBase<tag> *shader_; // TODO: should hold strong reference?
   std::atomic_bool ready_;
-  THREADGROUP_WORK_STATE work_state_;
   Sha1Hash hash_;
   Obj<MTL::Function> function_;
   void *compilation_args;
@@ -285,20 +315,38 @@ private:
   SM50_SHADER_COMPILATION_INPUT_SIGN_MASK_DATA data;
 };
 
-class AirconvPixelShaderWithSampleMask
-    : public AirconvShader<tag_pixel_shader> {
+class AirconvVertexShaderWithVertexPulling
+    : public AirconvShader<tag_vertex_shader> {
 public:
-  AirconvPixelShaderWithSampleMask(IMTLD3D11Device *pDevice,
-                                   TShaderBase<tag_pixel_shader> *shader,
-                                   uint32_t sample_mask)
-      : AirconvShader<tag_pixel_shader>(pDevice, shader, &data) {
-    data.type = SM50_SHADER_PSO_SAMPLE_MASK;
+  AirconvVertexShaderWithVertexPulling(IMTLD3D11Device *pDevice,
+                                       TShaderBase<tag_vertex_shader> *shader,
+                                       IMTLD3D11InputLayout *pInputLayout)
+      : AirconvShader<tag_vertex_shader>(pDevice, shader, &data) {
+    data.type = SM50_SHADER_IA_INPUT_LAYOUT;
     data.next = nullptr;
-    data.sample_mask = sample_mask;
+    data.num_elements = pInputLayout->GetInputLayoutElements(
+        (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&data.elements);
   };
 
 private:
-  SM50_SHADER_PSO_SAMPLE_MASK_DATA data;
+  SM50_SHADER_IA_INPUT_LAYOUT_DATA data;
+};
+
+class AirconvPixelShader
+    : public AirconvShader<tag_pixel_shader> {
+public:
+  AirconvPixelShader(IMTLD3D11Device *pDevice,
+                                   TShaderBase<tag_pixel_shader> *shader,
+                                   uint32_t sample_mask, bool dual_source_blending)
+      : AirconvShader<tag_pixel_shader>(pDevice, shader, &data) {
+    data.type = SM50_SHADER_PSO_PIXEL_SHADER;
+    data.next = nullptr;
+    data.sample_mask = sample_mask;
+    data.dual_source_blending = dual_source_blending;
+  };
+
+private:
+  SM50_SHADER_PSO_PIXEL_SHADER_DATA data;
 };
 
 class AirconvShaderEmulatedVertexSO
@@ -326,6 +374,32 @@ private:
   SM50_SHADER_COMPILATION_INPUT_SIGN_MASK_DATA data_sign_mask;
 };
 
+class AirconvShaderEmulatedVertexSOWithVertexPulling
+    : public AirconvShader<tag_emulated_vertex_so> {
+public:
+  AirconvShaderEmulatedVertexSOWithVertexPulling(
+      IMTLD3D11Device *pDevice, TShaderBase<tag_emulated_vertex_so> *shader,
+      IMTLD3D11InputLayout *pInputLayout)
+      : AirconvShader<tag_emulated_vertex_so>(pDevice, shader, &data) {
+    data.type = SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT;
+    data.next = &data_vertex_pulling;
+    data.num_output_slots = shader->data.NumSlots;
+    data.num_elements = shader->data.Elements.size();
+    memcpy(data.strides, shader->data.Strides.data(), sizeof(data.strides));
+    data.elements = shader->data.Elements.data();
+
+    data_vertex_pulling.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    data_vertex_pulling.next = nullptr;
+    data_vertex_pulling.num_elements = pInputLayout->GetInputLayoutElements(
+        (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&data_vertex_pulling.elements);
+  };
+
+private:
+  std::vector<uint32_t> entries;
+  SM50_SHADER_EMULATE_VERTEX_STREAM_OUTPUT_DATA data;
+  SM50_SHADER_IA_INPUT_LAYOUT_DATA data_vertex_pulling;
+};
+
 template <>
 void TShaderBase<tag_emulated_vertex_so>::GetCompiledShader(
     IMTLCompiledShader **pShader) {
@@ -351,58 +425,54 @@ void TShaderBase<tag>::GetCompiledShader(IMTLCompiledShader **pShader) {
   return;
 }
 
-template <>
-void TShaderBase<tag_emulated_vertex_so>::GetCompiledShaderWithInputLayerFixup(
-    uint64_t sign_mask, IMTLCompiledShader **pShader) {
-  if (sign_mask == 0) {
-    return GetCompiledShader(pShader);
-  }
-  if (with_input_layout_fixup_.contains(sign_mask)) {
-    *pShader = with_input_layout_fixup_[sign_mask].ref();
-  } else {
-    IMTLCompiledShader *shader =
-        new AirconvShaderEmulatedVertexSO(this->m_parent, this, sign_mask);
-    with_input_layout_fixup_.emplace(sign_mask, shader);
-    *pShader = ref(shader);
-    shader->SubmitWork();
-  }
-}
-
 template <typename tag>
-void TShaderBase<tag>::GetCompiledShaderWithInputLayerFixup(
-    uint64_t sign_mask, IMTLCompiledShader **pShader) {
-  if (sign_mask == 0) {
-    return GetCompiledShader(pShader);
-  }
-  if (with_input_layout_fixup_.contains(sign_mask)) {
-    *pShader = with_input_layout_fixup_[sign_mask].ref();
-  } else {
-    IMTLCompiledShader *shader = new AirconvShaderWithInputLayoutFixup<tag>(
-        this->m_parent, this, sign_mask);
-    with_input_layout_fixup_.emplace(sign_mask, shader);
-    *pShader = ref(shader);
-    shader->SubmitWork();
-  }
-}
-
-template <typename tag>
-void TShaderBase<tag>::GetCompiledPixelShaderWithSampleMask(
-    uint32_t sample_mask, IMTLCompiledShader **pShader) {
+void TShaderBase<tag>::GetCompiledVertexShaderWithVertexPulling(
+    IMTLD3D11InputLayout *pInputLayout, IMTLCompiledShader **pShader) {
   D3D11_ASSERT(0 && "should not call this function");
 }
 
 template <>
-void TShaderBase<tag_pixel_shader>::GetCompiledPixelShaderWithSampleMask(
-    uint32_t sample_mask, IMTLCompiledShader **pShader) {
-  if (sample_mask == 0xffffffff) {
-    return GetCompiledShader(pShader);
-  }
-  if (data.contains(sample_mask)) {
-    *pShader = data[sample_mask].ref();
+void TShaderBase<tag_vertex_shader>::GetCompiledVertexShaderWithVertexPulling(
+    IMTLD3D11InputLayout *pInputLayout, IMTLCompiledShader **pShader) {
+  if (data.contains(pInputLayout)) {
+    *pShader = data[pInputLayout].ref();
   } else {
-    IMTLCompiledShader *shader =
-        new AirconvPixelShaderWithSampleMask(this->m_parent, this, sample_mask);
-    with_input_layout_fixup_.emplace(sample_mask, shader);
+    IMTLCompiledShader *shader = new AirconvVertexShaderWithVertexPulling(
+        this->m_parent, this, pInputLayout);
+    data.emplace(pInputLayout, shader);
+    *pShader = ref(shader);
+    shader->SubmitWork();
+  }
+}
+
+template <>
+void TShaderBase<tag_emulated_vertex_so>::
+    GetCompiledVertexShaderWithVertexPulling(IMTLD3D11InputLayout *pInputLayout,
+                                             IMTLCompiledShader **pShader) {
+  IMTLCompiledShader *shader =
+      new AirconvShaderEmulatedVertexSOWithVertexPulling(this->m_parent, this,
+                                                         pInputLayout);
+  *pShader = ref(shader);
+  shader->SubmitWork();
+}
+
+template <typename tag>
+void TShaderBase<tag>::GetCompiledPixelShader(uint32_t sample_mask, bool,
+                                              IMTLCompiledShader **pShader) {
+  D3D11_ASSERT(0 && "should not call this function");
+}
+
+template <>
+void TShaderBase<tag_pixel_shader>::GetCompiledPixelShader(
+    uint32_t SampleMask, bool DualSourceBlending,
+    IMTLCompiledShader **pShader) {
+  if (!DualSourceBlending && data.contains(SampleMask)) {
+    *pShader = data[SampleMask].ref();
+  } else {
+    IMTLCompiledShader *shader = new AirconvPixelShader(
+        this->m_parent, this, SampleMask, DualSourceBlending);
+    if (!DualSourceBlending)
+      data.emplace(SampleMask, shader);
     *pShader = ref(shader);
     shader->SubmitWork();
   }
@@ -451,6 +521,27 @@ public:
 #endif
   }
 
+  bool dumped = false;
+
+  void Dump() {
+    if(dumped) {
+      return;
+    }
+#ifdef DXMT_DEBUG
+    std::fstream dump_out;
+    dump_out.open("shader_dump_" + std::to_string(id) + ".cso",
+                  std::ios::out | std::ios::binary);
+    if (dump_out) {
+      dump_out.write((char *)dump, dump_len);
+    }
+    dump_out.close();
+    ERR("dumped to ./shader_dump_" + std::to_string(id) + ".cso");
+#else
+    WARN("shader dump disabled");
+#endif
+  dumped = true;
+  }
+
   HRESULT QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)
       return E_POINTER;
@@ -476,24 +567,27 @@ public:
     return E_NOINTERFACE;
   }
 
+  uint64_t GetUniqueId() final { return id; }
+
+  void *GetAirconvHandle() final { return nullptr; }
+
   void GetCompiledShader(IMTLCompiledShader **ppShader) final {
     // D3D11_ASSERT(0 && "should not call this function");
     *ppShader = nullptr;
   };
 
-  void GetCompiledShaderWithInputLayerFixup(uint64_t,
-                                            IMTLCompiledShader **) final {
+  void GetCompiledVertexShaderWithVertexPulling(IMTLD3D11InputLayout *,
+                                                IMTLCompiledShader **) final {
     // D3D11_ASSERT(0 && "should not call this function");
   };
 
-  void GetCompiledPixelShaderWithSampleMask(uint32_t,
-                                            IMTLCompiledShader **) final {
+  void GetCompiledPixelShader(uint32_t, bool, IMTLCompiledShader **) final {
     D3D11_ASSERT(0 && "should not call this function");
   };
 
-  void GetReflection(MTL_SHADER_REFLECTION **pRefl) final {
+  const MTL_SHADER_REFLECTION *GetReflection() final {
     D3D11_ASSERT(0 && "should not call this function");
-    *pRefl = &reflection;
+    return nullptr;
   }
 
   MTL_SHADER_REFLECTION reflection{};
@@ -526,20 +620,17 @@ HRESULT CreatePixelShader(IMTLD3D11Device *pDevice, const void *pShaderBytecode,
                                                 BytecodeLength, ppShader);
 }
 
-HRESULT CreateDummyHullShader(IMTLD3D11Device *pDevice,
-                              const void *pShaderBytecode,
-                              SIZE_T BytecodeLength,
-                              ID3D11HullShader **ppShader) {
-  return CreateDummyShaderInternal<tag_hull_shader>(pDevice, pShaderBytecode,
-                                                    BytecodeLength, ppShader);
+HRESULT CreateHullShader(IMTLD3D11Device *pDevice, const void *pShaderBytecode,
+                         SIZE_T BytecodeLength, ID3D11HullShader **ppShader) {
+  return CreateShaderInternal<tag_hull_shader>(pDevice, pShaderBytecode,
+                                               BytecodeLength, ppShader);
 }
 
-HRESULT CreateDummyDomainShader(IMTLD3D11Device *pDevice,
-                                const void *pShaderBytecode,
-                                SIZE_T BytecodeLength,
-                                ID3D11DomainShader **ppShader) {
-  return CreateDummyShaderInternal<tag_domain_shader>(pDevice, pShaderBytecode,
-                                                      BytecodeLength, ppShader);
+HRESULT CreateDomainShader(IMTLD3D11Device *pDevice,
+                           const void *pShaderBytecode, SIZE_T BytecodeLength,
+                           ID3D11DomainShader **ppShader) {
+  return CreateShaderInternal<tag_domain_shader>(pDevice, pShaderBytecode,
+                                                 BytecodeLength, ppShader);
 }
 
 HRESULT CreateDummyGeometryShader(IMTLD3D11Device *pDevice,

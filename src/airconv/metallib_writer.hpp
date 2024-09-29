@@ -59,6 +59,8 @@ enum class FunctionType : uint8_t {
   Vertex = 0x00,
   Fragment = 0x01,
   Kernel = 0x02,
+  Mesh = 0x07,
+  Object = 0x08,
 };
 
 struct __attribute__((packed)) MTLB_TYPE_TAG {
@@ -94,6 +96,13 @@ struct __attribute__((packed)) MTLB_MDSZ_TAG {
   MTLBFourCC TAG = MTLBFourCC::Size;
   uint16_t TAG_SIZE = 0x08;
   uint64_t bitcodeSize;
+};
+
+struct __attribute__((packed)) MTLB_TESS_TAG {
+  MTLBFourCC TAG = MTLBFourCC::Tess;
+  uint16_t TAG_SIZE = 1;
+  uint8_t patchType : 2; // triangle - 1, quad - 2
+  uint8_t controlPointCount : 6;
 };
 
 struct __attribute__((packed)) MTLB_VATY {

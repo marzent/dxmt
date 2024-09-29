@@ -12,31 +12,33 @@ struct MTL_COMPILED_SHADER {
   */
   MTL::Function *Function;
   dxmt::Sha1Hash *MetallibHash;
-  MTL_SHADER_REFLECTION *Reflection;
 };
+
+struct IMTLD3D11InputLayout;
 
 DEFINE_COM_INTERFACE("a8bfeef7-a453-4bce-90c1-912b02cf5cdf", IMTLCompiledShader)
     : public IMTLThreadpoolWork {
   virtual void SubmitWork() = 0;
-  virtual bool IsReady() = 0;
   /**
-  NOTE: the current thread is blocked if it's not ready
+  return false if it's not ready
    */
-  virtual void GetShader(MTL_COMPILED_SHADER * pShaderData) = 0;
+  virtual bool GetShader(MTL_COMPILED_SHADER * pShaderData) = 0;
 
   virtual void Dump() = 0;
-
-  virtual uint64_t GetId() = 0;
 };
 
 DEFINE_COM_INTERFACE("e95ba1c7-e43f-49c3-a907-4ac669c9fb42", IMTLD3D11Shader)
     : public IUnknown {
+  virtual void Dump() = 0;
+  virtual uint64_t GetUniqueId() = 0;
+  virtual void *GetAirconvHandle() = 0;
   virtual void GetCompiledShader(IMTLCompiledShader * *ppShader) = 0;
-  virtual void GetCompiledShaderWithInputLayerFixup(
-      uint64_t sign_mask, IMTLCompiledShader * *ppShader) = 0;
-  virtual void GetCompiledPixelShaderWithSampleMask(
-      uint32_t sample_mask, IMTLCompiledShader * *ppShader) = 0;
-  virtual void GetReflection(MTL_SHADER_REFLECTION * *pRefl) = 0;
+  virtual void GetCompiledPixelShader(uint32_t SampleMask,
+                                      bool DualSourceBlending,
+                                      IMTLCompiledShader **ppShader) = 0;
+  virtual void GetCompiledVertexShaderWithVertexPulling(
+      IMTLD3D11InputLayout * pInputLayout, IMTLCompiledShader * *pShader) = 0;
+  virtual const MTL_SHADER_REFLECTION *GetReflection() = 0;
 };
 
 namespace dxmt {
@@ -57,15 +59,12 @@ HRESULT CreateVertexShader(IMTLD3D11Device *pDevice,
 HRESULT CreatePixelShader(IMTLD3D11Device *pDevice, const void *pShaderBytecode,
                           SIZE_T BytecodeLength, ID3D11PixelShader **ppShader);
 
-HRESULT CreateDummyHullShader(IMTLD3D11Device *pDevice,
-                              const void *pShaderBytecode,
-                              SIZE_T BytecodeLength,
-                              ID3D11HullShader **ppShader);
+HRESULT CreateHullShader(IMTLD3D11Device *pDevice, const void *pShaderBytecode,
+                         SIZE_T BytecodeLength, ID3D11HullShader **ppShader);
 
-HRESULT CreateDummyDomainShader(IMTLD3D11Device *pDevice,
-                                const void *pShaderBytecode,
-                                SIZE_T BytecodeLength,
-                                ID3D11DomainShader **ppShader);
+HRESULT CreateDomainShader(IMTLD3D11Device *pDevice,
+                           const void *pShaderBytecode, SIZE_T BytecodeLength,
+                           ID3D11DomainShader **ppShader);
 
 HRESULT CreateDummyGeometryShader(IMTLD3D11Device *pDevice,
                                   const void *pShaderBytecode,

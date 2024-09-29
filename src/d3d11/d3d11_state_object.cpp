@@ -6,7 +6,6 @@
 #include "d3d11_device.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
-#include "util_hash.hpp"
 #include "d3d11_device_child.hpp"
 #include "Metal/MTLRenderCommandEncoder.hpp"
 #include "Metal/MTLSampler.hpp"
@@ -219,7 +218,14 @@ class MTLD3D11BlendState : public ManagedDeviceChild<IMTLD3D11BlendState> {
 public:
   friend class MTLD3D11DeviceContext;
   MTLD3D11BlendState(IMTLD3D11Device *device, const D3D11_BLEND_DESC1 &desc)
-      : ManagedDeviceChild<IMTLD3D11BlendState>(device), desc_(desc) {}
+      : ManagedDeviceChild<IMTLD3D11BlendState>(device), desc_(desc) {
+    dual_source_blending_ =
+        !desc_.IndependentBlendEnable &&
+        (desc_.RenderTarget[0].SrcBlend >= D3D11_BLEND_SRC1_COLOR ||
+         desc_.RenderTarget[0].SrcBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
+         desc_.RenderTarget[0].DestBlendAlpha >= D3D11_BLEND_SRC1_COLOR ||
+         desc_.RenderTarget[0].DestBlend >= D3D11_BLEND_SRC1_COLOR);
+  }
   ~MTLD3D11BlendState() {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
@@ -230,7 +236,7 @@ public:
     *ppvObject = nullptr;
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11DeviceChild) ||
-        riid == __uuidof(ID3D11DepthStencilState) ||
+        riid == __uuidof(ID3D11BlendState) ||
         riid == __uuidof(IMTLD3D11BlendState)) {
       *ppvObject = ref(this);
       return S_OK;
@@ -264,6 +270,8 @@ public:
     *pDesc = desc_;
   }
 
+  bool IsDualSourceBlending() { return dual_source_blending_; }
+
   void SetupMetalPipelineDescriptor(
       MTL::RenderPipelineDescriptor *render_pipeline_descriptor) {
     for (unsigned rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; rt++) {
@@ -285,20 +293,18 @@ public:
           kBlendOpMap[renderTarget.BlendOpAlpha]);
       attachment_desc->setRgbBlendOperation(kBlendOpMap[renderTarget.BlendOp]);
       attachment_desc->setBlendingEnabled(renderTarget.BlendEnable);
-      attachment_desc->setSourceAlphaBlendFactor(
-          kBlendFactorMap[renderTarget.SrcBlendAlpha]);
-      attachment_desc->setSourceRGBBlendFactor(
-          kBlendFactorMap[renderTarget.SrcBlend]);
-      attachment_desc->setDestinationAlphaBlendFactor(
-          kBlendFactorMap[renderTarget.DestBlendAlpha]);
-      attachment_desc->setDestinationRGBBlendFactor(
-          kBlendFactorMap[renderTarget.DestBlend]);
+      if (renderTarget.BlendEnable) {
+        attachment_desc->setSourceAlphaBlendFactor(
+            kBlendFactorMap[renderTarget.SrcBlendAlpha]);
+        attachment_desc->setSourceRGBBlendFactor(
+            kBlendFactorMap[renderTarget.SrcBlend]);
+        attachment_desc->setDestinationAlphaBlendFactor(
+            kBlendFactorMap[renderTarget.DestBlendAlpha]);
+        attachment_desc->setDestinationRGBBlendFactor(
+            kBlendFactorMap[renderTarget.DestBlend]);
+      }
       attachment_desc->setWriteMask(
           kColorWriteMaskMap[renderTarget.RenderTargetWriteMask]);
-      D3D11_ASSERT(renderTarget.SrcBlend < D3D11_BLEND_SRC1_COLOR);
-      D3D11_ASSERT(renderTarget.SrcBlendAlpha < D3D11_BLEND_SRC1_COLOR);
-      D3D11_ASSERT(renderTarget.DestBlendAlpha < D3D11_BLEND_SRC1_COLOR);
-      D3D11_ASSERT(renderTarget.DestBlend < D3D11_BLEND_SRC1_COLOR);
     }
     render_pipeline_descriptor->setAlphaToCoverageEnabled(
         desc_.AlphaToCoverageEnable);
@@ -306,6 +312,7 @@ public:
 
 private:
   const D3D11_BLEND_DESC1 desc_;
+  bool dual_source_blending_;
 };
 
 // RasterizerState
@@ -420,10 +427,12 @@ public:
 
     // m_desc.ScissorEnable : handled outside
 
-    // m_desc.ForcedSampleCount : not supported?
+    // m_desc.ForcedSampleCount : handled outside
   }
 
   bool IsScissorEnabled() { return m_desc.ScissorEnable; }
+
+  uint32_t UAVOnlySampleCount() { return std::max(1u, m_desc.ForcedSampleCount); }
 
 private:
   const D3D11_RASTERIZER_DESC2 m_desc;
@@ -745,22 +754,34 @@ StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState>::CreateStateObject(
   std::lock_guard<dxmt::mutex> lock(mutex_cache);
   InitReturnPtr(ppBlendState);
 
-  // TODO: validate
-  // if(pBlendStateDesc->AlphaToCoverageEnable)
   if (!pBlendStateDesc)
     return E_INVALIDARG;
+
+  unsigned num_blend_target = pBlendStateDesc->IndependentBlendEnable ? 8 : 1;
+  for (unsigned i = 0; i < num_blend_target; i++) {
+    auto &blend_target = pBlendStateDesc->RenderTarget[i];
+    if (blend_target.BlendEnable && blend_target.LogicOpEnable) {
+      return E_INVALIDARG;
+    }
+  }
 
   if (!ppBlendState)
     return S_FALSE;
 
-  if (cache.contains(*pBlendStateDesc)) {
-    cache.at(*pBlendStateDesc)->QueryInterface(IID_PPV_ARGS(ppBlendState));
+  D3D11_BLEND_DESC1 desc_normalized = *pBlendStateDesc;
+  desc_normalized.AlphaToCoverageEnable =
+      bool(desc_normalized.AlphaToCoverageEnable);
+  desc_normalized.IndependentBlendEnable =
+      bool(desc_normalized.IndependentBlendEnable);
+
+  if (cache.contains(desc_normalized)) {
+    cache.at(desc_normalized)->QueryInterface(IID_PPV_ARGS(ppBlendState));
     return S_OK;
   }
 
-  cache.emplace(*pBlendStateDesc,
-                std::make_unique<MTLD3D11BlendState>(device, *pBlendStateDesc));
-  cache.at(*pBlendStateDesc)->QueryInterface(IID_PPV_ARGS(ppBlendState));
+  cache.emplace(desc_normalized,
+                std::make_unique<MTLD3D11BlendState>(device, desc_normalized));
+  cache.at(desc_normalized)->QueryInterface(IID_PPV_ARGS(ppBlendState));
 
   return S_OK;
 }

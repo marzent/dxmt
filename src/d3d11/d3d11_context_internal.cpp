@@ -17,18 +17,27 @@ since it is for internal use only
 
 namespace dxmt {
 
+template <bool Tessellation>
 inline MTL_BINDABLE_RESIDENCY_MASK GetResidencyMask(ShaderType type, bool read,
                                                     bool write) {
   switch (type) {
   case ShaderType::Vertex:
-    return (read ? MTL_RESIDENCY_VERTEX_READ : MTL_RESIDENCY_NULL) |
-           (write ? MTL_RESIDENCY_VERTEX_WRITE : MTL_RESIDENCY_NULL);
+    if constexpr (Tessellation)
+      return (read ? MTL_RESIDENCY_OBJECT_READ : MTL_RESIDENCY_NULL) |
+             (write ? MTL_RESIDENCY_OBJECT_WRITE : MTL_RESIDENCY_NULL);
+    else
+      return (read ? MTL_RESIDENCY_VERTEX_READ : MTL_RESIDENCY_NULL) |
+             (write ? MTL_RESIDENCY_VERTEX_WRITE : MTL_RESIDENCY_NULL);
   case ShaderType::Pixel:
     return (read ? MTL_RESIDENCY_FRAGMENT_READ : MTL_RESIDENCY_NULL) |
            (write ? MTL_RESIDENCY_FRAGMENT_WRITE : MTL_RESIDENCY_NULL);
-  case ShaderType::Geometry:
   case ShaderType::Hull:
+    return (read ? MTL_RESIDENCY_MESH_READ : MTL_RESIDENCY_NULL) |
+           (write ? MTL_RESIDENCY_MESH_WRITE : MTL_RESIDENCY_NULL);
   case ShaderType::Domain:
+    return (read ? MTL_RESIDENCY_VERTEX_READ : MTL_RESIDENCY_NULL) |
+           (write ? MTL_RESIDENCY_VERTEX_WRITE : MTL_RESIDENCY_NULL);
+  case ShaderType::Geometry:
     D3D11_ASSERT(0 && "TODO");
     break;
   case ShaderType::Compute:
@@ -50,8 +59,330 @@ GetStagesFromResidencyMask(MTL_BINDABLE_RESIDENCY_MASK mask) {
               : 0) |
          ((mask & (MTL_RESIDENCY_VERTEX_READ | MTL_RESIDENCY_VERTEX_WRITE))
               ? MTL::RenderStageVertex
+              : 0) |
+         ((mask & (MTL_RESIDENCY_OBJECT_READ | MTL_RESIDENCY_OBJECT_WRITE))
+              ? MTL::RenderStageObject
+              : 0)
+              |
+         ((mask & (MTL_RESIDENCY_MESH_READ | MTL_RESIDENCY_MESH_WRITE))
+              ? MTL::RenderStageMesh
               : 0);
 }
+
+struct Subresource {
+  DXGI_FORMAT Format;
+  uint32_t MipLevel;
+  uint32_t ArraySlice;
+  uint32_t Width;
+  uint32_t Height;
+  uint32_t Depth;
+};
+
+class BlitObject {
+public:
+  ID3D11Resource *pResource;
+  MTL_FORMAT_DESC FormatDescription;
+  D3D11_RESOURCE_DIMENSION Dimension;
+  union {
+    D3D11_TEXTURE1D_DESC Texture1DDesc;
+    D3D11_TEXTURE2D_DESC1 Texture2DDesc;
+    D3D11_TEXTURE3D_DESC1 Texture3DDesc;
+    D3D11_BUFFER_DESC BufferDesc;
+  };
+
+  BlitObject(IMTLDXGIAdatper *pAdapter, ID3D11Resource *pResource)
+      : pResource(pResource) {
+    pResource->GetType(&Dimension);
+    switch (Dimension) {
+    case D3D11_RESOURCE_DIMENSION_UNKNOWN:
+      break;
+    case D3D11_RESOURCE_DIMENSION_BUFFER:
+      reinterpret_cast<ID3D11Buffer *>(pResource)->GetDesc(&BufferDesc);
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+      reinterpret_cast<ID3D11Texture1D *>(pResource)->GetDesc(&Texture1DDesc);
+      pAdapter->QueryFormatDesc(Texture1DDesc.Format, &FormatDescription);
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+      reinterpret_cast<ID3D11Texture2D1 *>(pResource)->GetDesc1(&Texture2DDesc);
+      pAdapter->QueryFormatDesc(Texture2DDesc.Format, &FormatDescription);
+      break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+      reinterpret_cast<ID3D11Texture3D1 *>(pResource)->GetDesc1(&Texture3DDesc);
+      pAdapter->QueryFormatDesc(Texture3DDesc.Format, &FormatDescription);
+      break;
+    }
+  };
+};
+
+class TextureCopyCommand {
+public:
+  ID3D11Resource *pSrc;
+  ID3D11Resource *pDst;
+  uint32_t SrcSubresource;
+  uint32_t DstSubresource;
+
+  Subresource Src;
+  Subresource Dst;
+  MTL::Origin SrcOrigin;
+  MTL::Size SrcSize;
+  MTL::Origin DstOrigin;
+
+  MTL_FORMAT_DESC SrcFormat;
+  MTL_FORMAT_DESC DstFormat;
+
+  bool Invalid = true;
+
+  TextureCopyCommand(BlitObject &Dst_, UINT DstSubresource, UINT DstX,
+                     UINT DstY, UINT DstZ, BlitObject &Src_,
+                     UINT SrcSubresource, const D3D11_BOX *pSrcBox)
+      : pSrc(Src_.pResource), pDst(Dst_.pResource), SrcSubresource(SrcSubresource),
+        DstSubresource(DstSubresource), SrcFormat(Src_.FormatDescription),
+        DstFormat(Dst_.FormatDescription) {
+    if (Dst_.Dimension != Src_.Dimension)
+      return;
+
+    if(SrcFormat.PixelFormat == MTL::PixelFormatInvalid)
+      return;
+    if(DstFormat.PixelFormat == MTL::PixelFormatInvalid)
+      return;
+
+    switch (Dst_.Dimension) {
+    default: {
+      return;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+      D3D11_TEXTURE1D_DESC& dst_desc = Dst_.Texture1DDesc;
+      D3D11_TEXTURE1D_DESC& src_desc = Src_.Texture1DDesc;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
+      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = 1;
+      Src.Depth = 1;
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
+      Dst.ArraySlice = DstSubresource / dst_desc.MipLevels;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = 1;
+      Dst.Depth = 1;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+      D3D11_TEXTURE2D_DESC1& dst_desc = Dst_.Texture2DDesc;
+      D3D11_TEXTURE2D_DESC1& src_desc = Src_.Texture2DDesc;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource % src_desc.MipLevels;
+      Src.ArraySlice = SrcSubresource / src_desc.MipLevels;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
+      Src.Depth = 1;
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
+      Dst.ArraySlice = DstSubresource / dst_desc.MipLevels;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
+      Dst.Depth = 1;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+      D3D11_TEXTURE3D_DESC1& dst_desc = Dst_.Texture3DDesc;
+      D3D11_TEXTURE3D_DESC1& src_desc = Src_.Texture3DDesc;
+
+      Src.Format = src_desc.Format;
+      Src.MipLevel = SrcSubresource;
+      Src.ArraySlice = 0;
+      Src.Width = std::max(1u, src_desc.Width >> Src.MipLevel);
+      Src.Height = std::max(1u, src_desc.Height >> Src.MipLevel);
+      Src.Depth = std::max(1u, src_desc.Depth >> Src.MipLevel);
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource;
+      Dst.ArraySlice = 0;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
+      Dst.Depth = std::max(1u, dst_desc.Depth >> Dst.MipLevel);
+
+      break;
+    }
+    }
+
+    D3D11_BOX SrcBox;
+
+    if (pSrcBox) {
+      if (pSrcBox->left >= pSrcBox->right)
+        return;
+      if (pSrcBox->top >= pSrcBox->bottom)
+        return;
+      if (pSrcBox->front >= pSrcBox->back)
+        return;
+      SrcBox = *pSrcBox;
+    } else {
+      SrcBox = {0, 0, 0, Src.Width, Src.Height, Src.Depth};
+    }
+
+    // Discard, if source box does't overlap with source size at all
+    if (SrcBox.left >= Src.Width)
+      return;
+    if (SrcBox.top >= Src.Height)
+      return;
+    if (SrcBox.front >= Src.Depth)
+      return;
+
+    // Discard, if dest origin is not even within dest
+    if (DstX >= Dst.Width)
+      return;
+    if (DstY >= Dst.Height)
+      return;
+    if (DstZ >= Dst.Depth)
+      return;
+
+    // Clip source box, if it's larger than source size
+    // It is useful for copying between BC textures
+    // since Metal takes virtual size
+    // while D3D11 requires block size aligned (typically 4x)
+    SrcBox.right = std::min(SrcBox.right, Src.Width);
+    SrcBox.bottom = std::min(SrcBox.bottom, Src.Height);
+    SrcBox.back = std::min(SrcBox.back, Src.Depth);
+
+    if (DstFormat.IsCompressed == SrcFormat.IsCompressed) {
+      // Discard, if the copy overflow
+      if ((DstX + SrcBox.right - SrcBox.left) > Dst.Width)
+        return;
+      if ((DstY + SrcBox.bottom - SrcBox.top) > Dst.Height)
+        return;
+      if ((DstZ + SrcBox.back - SrcBox.front) > Dst.Depth)
+        return;
+    }
+
+    DstOrigin = {DstX, DstY, DstZ};
+    SrcOrigin = {SrcBox.left, SrcBox.top, SrcBox.front};
+    SrcSize = {SrcBox.right - SrcBox.left, SrcBox.bottom - SrcBox.top,
+               SrcBox.back - SrcBox.front};
+
+    Invalid = false;
+  }
+};
+
+class TextureUpdateCommand {
+public:
+  ID3D11Resource *pDst;
+  Subresource Dst;
+  MTL::Region DstRegion;
+  uint32_t EffectiveBytesPerRow;
+  uint32_t EffectiveRows;
+
+  MTL_FORMAT_DESC DstFormat;
+
+  bool Invalid = true;
+
+  TextureUpdateCommand(BlitObject &Dst_, UINT DstSubresource,
+                       const D3D11_BOX *pDstBox)
+      : pDst(Dst_.pResource), DstFormat(Dst_.FormatDescription) {
+
+    if(DstFormat.PixelFormat == MTL::PixelFormatInvalid)
+      return;
+
+    switch (Dst_.Dimension) {
+    default: {
+      return;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+      D3D11_TEXTURE1D_DESC &dst_desc = Dst_.Texture1DDesc;
+
+      if(DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize)
+        return;
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
+      Dst.ArraySlice = DstSubresource / dst_desc.MipLevels;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = 1;
+      Dst.Depth = 1;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+      D3D11_TEXTURE2D_DESC1 dst_desc = Dst_.Texture2DDesc;
+
+      if(DstSubresource >= dst_desc.MipLevels * dst_desc.ArraySize)
+        return;
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource % dst_desc.MipLevels;
+      Dst.ArraySlice = DstSubresource / dst_desc.MipLevels;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
+      Dst.Depth = 1;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+      D3D11_TEXTURE3D_DESC1 dst_desc = Dst_.Texture3DDesc;
+
+      if(DstSubresource >= dst_desc.MipLevels)
+        return;
+
+      Dst.Format = dst_desc.Format;
+      Dst.MipLevel = DstSubresource;
+      Dst.ArraySlice = 0;
+      Dst.Width = std::max(1u, dst_desc.Width >> Dst.MipLevel);
+      Dst.Height = std::max(1u, dst_desc.Height >> Dst.MipLevel);
+      Dst.Depth = std::max(1u, dst_desc.Depth >> Dst.MipLevel);
+      break;
+    }
+    }
+
+    D3D11_BOX DstBox;
+
+    if (pDstBox) {
+      if (pDstBox->left >= pDstBox->right)
+        return;
+      if (pDstBox->top >= pDstBox->bottom)
+        return;
+      if (pDstBox->front >= pDstBox->back)
+        return;
+      DstBox = *pDstBox;
+    } else {
+      DstBox = {0, 0, 0, Dst.Width, Dst.Height, Dst.Depth};
+    }
+
+    // Discard, if box does't overlap with the texure at all
+    if (DstBox.left >= Dst.Width)
+      return;
+    if (DstBox.top >= Dst.Height)
+      return;
+    if (DstBox.front >= Dst.Depth)
+      return;
+
+    // It is useful for copying between BC textures
+    // since Metal takes virtual size
+    // while D3D11 requires block size aligned (typically 4x)
+    DstBox.right = std::min(DstBox.right, Dst.Width);
+    DstBox.bottom = std::min(DstBox.bottom, Dst.Height);
+    DstBox.back = std::min(DstBox.back, Dst.Depth);
+
+    DstRegion = {DstBox.left,
+                 DstBox.top,
+                 DstBox.front,
+                 DstBox.right - DstBox.left,
+                 DstBox.bottom - DstBox.top,
+                 DstBox.back - DstBox.front};
+
+    if (DstFormat.IsCompressed) {
+      EffectiveBytesPerRow =
+          (align(DstRegion.size.width, 4u) >> 2) * DstFormat.BytesPerTexel;
+      EffectiveRows = align(DstRegion.size.height, 4u) >> 2;
+    } else {
+      EffectiveBytesPerRow = DstRegion.size.width * DstFormat.BytesPerTexel;
+      EffectiveRows = DstRegion.size.height;
+    }
+
+    Invalid = false;
+  }
+};
 
 class ContextInternal {
 
@@ -73,6 +404,27 @@ public:
     default_depth_stencil_state->Release();
   }
 
+  /**
+  Valid transition:
+  * -> Idle
+  Idle -> RenderEncoderActive
+  Idle -> ComputeEncoderActive
+  Idle -> (Upload|Readback)BlitEncoderActive
+  RenderEncoderActive <-> RenderPipelineReady
+  ComputeEncoderActive <-> CoputePipelineReady
+  */
+  enum class CommandBufferState {
+    Idle,
+    RenderEncoderActive,
+    RenderPipelineReady,
+    TessellationRenderPipelineReady,
+    ComputeEncoderActive,
+    ComputePipelineReady,
+    BlitEncoderActive,
+    UpdateBlitEncoderActive,
+    ReadbackBlitEncoderActive
+  };
+
 #pragma region ShaderCommon
 
   template <ShaderType Type, typename IShader>
@@ -83,8 +435,8 @@ public:
     if (pShader) {
       if (auto expected = com_cast<IMTLD3D11Shader>(pShader)) {
         ShaderStage.Shader = std::move(expected);
-        Com<IMTLCompiledShader> _;
-        ShaderStage.Shader->GetCompiledShader(&_);
+        // Com<IMTLCompiledShader> _;
+        // ShaderStage.Shader->GetCompiledShader(&_);
         ShaderStage.ConstantBuffers.set_dirty();
         ShaderStage.SRVs.set_dirty();
         ShaderStage.Samplers.set_dirty();
@@ -324,19 +676,31 @@ public:
     //   return false;
     // });
 
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+
     for (unsigned slot = StartSlot; slot < StartSlot + NumUAVs; slot++) {
       auto pUAV = ppUnorderedAccessViews[slot - StartSlot];
       auto InitialCount =
           pUAVInitialCounts ? pUAVInitialCounts[slot - StartSlot] : ~0u;
       if (pUAV) {
+        auto uav = com_cast<IMTLD3D11UnorderedAccessView>(pUAV);
         bool replaced = false;
         auto &entry = binding_set.bind(slot, {pUAV}, replaced);
+        if (InitialCount != ~0u) {
+          auto new_counter_handle = cmd_queue.counter_pool.AllocateCounter(
+              currentChunkId, InitialCount);
+          // it's possible that old_counter_handle == new_counter_handle 
+          // if the uav doesn't support counter
+          // thus it becomes essentially a no-op.
+          auto old_counter_handle = uav->SwapCounter(new_counter_handle);
+          if (old_counter_handle != DXMT_NO_COUNTER) {
+            cmd_queue.counter_pool.DiscardCounter(currentChunkId,
+                                                  old_counter_handle);
+          }
+        }
         if (!replaced) {
-          // FIXME: update initial count
           continue;
         }
-        // FIXME: handle keep current counter...
-        entry.InitialCountValue = InitialCount;
         if (auto expected = com_cast<IMTLBindable>(pUAV)) {
           entry.View = std::move(expected);
         } else {
@@ -476,7 +840,7 @@ public:
           auto src = src_.buffer();
           encoder->copyFromBuffer(src, SrcBox.left, dst, DstX,
                                   SrcBox.right - SrcBox.left);
-        });
+        }, ContextInternal::CommandBufferState::ReadbackBlitEncoderActive);
         promote_flush = true;
       } else {
         D3D11_ASSERT(0 && "todo");
@@ -554,315 +918,274 @@ public:
     }
   }
 
-  void CopyTexture1D(ID3D11Texture1D *pDstResource, uint32_t DstSubresource,
-                     uint32_t DstX, uint32_t DstY, uint32_t DstZ,
-                     ID3D11Texture1D *pSrcResource, uint32_t SrcSubresource,
-                     const D3D11_BOX *pSrcBox) {
-    D3D11_TEXTURE1D_DESC dst_desc;
-    D3D11_TEXTURE1D_DESC src_desc;
-    pDstResource->GetDesc(&dst_desc);
-    pSrcResource->GetDesc(&src_desc);
-    auto src_width =
-        std::max(1u, src_desc.Width >> (SrcSubresource % src_desc.MipLevels));
-    D3D11_BOX SrcBox;
-    if (pSrcBox) {
-      SrcBox = *pSrcBox;
-    } else {
-      SrcBox.left = 0;
-      SrcBox.right = src_width;
-    }
-    if (SrcBox.right <= SrcBox.left)
+  void CopyTexture(TextureCopyCommand &&cmd) {
+    if (cmd.Invalid)
       return;
-    auto currentChunkId = cmd_queue.CurrentSeqId();
-    if (auto staging_dst = com_cast<IMTLD3D11Staging>(pDstResource)) {
-      if (auto staging_src = com_cast<IMTLD3D11Staging>(pSrcResource)) {
-        D3D11_ASSERT(0 && "tod: copy between staging");
-      } else if (auto src = com_cast<IMTLBindable>(pSrcResource)) {
-        // copy from device to staging
-        MTL_STAGING_RESOURCE dst_bind;
-        uint32_t bytes_per_row, bytes_per_image;
-        if (!staging_dst->UseCopyDestination(DstSubresource, currentChunkId,
-                                             &dst_bind, &bytes_per_row,
-                                             &bytes_per_image))
-          return;
-        EmitBlitCommand<true>([src_ = src->UseBindable(currentChunkId),
-                               dst = Obj(dst_bind.Buffer), bytes_per_row,
-                               SrcSubresource, DstX, SrcBox](
-                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
-          auto src = src_.texture(&ctx);
-          auto src_mips = src->mipmapLevelCount();
-          auto src_level = SrcSubresource % src_mips;
-          auto src_slice = SrcSubresource / src_mips;
-          D3D11_ASSERT(DstX == 0);
-          encoder->copyFromTexture(
-              src, src_slice, src_level, MTL::Origin::Make(SrcBox.left, 0, 0),
-              MTL::Size::Make(SrcBox.right - SrcBox.left, 1, 1), dst.ptr(),
-              /* offset */ 0, bytes_per_row, 0);
-          // offset should be DstX*BytesPerTexel
-        });
-        promote_flush = true;
+    if (cmd.SrcFormat.IsCompressed != cmd.DstFormat.IsCompressed) {
+      if (cmd.SrcFormat.IsCompressed) {
+        return CopyTextureFromCompressed(std::move(cmd));
       } else {
-        D3D11_ASSERT(0 && "todo");
+        return CopyTextureToCompressed(std::move(cmd));
       }
-    } else if (dst_desc.Usage == D3D11_USAGE_DEFAULT) {
-      auto dst = com_cast<IMTLBindable>(pDstResource);
-      D3D11_ASSERT(dst);
-      if (auto staging_src = com_cast<IMTLD3D11Staging>(pSrcResource)) {
-        // copy from staging to default
-        MTL_STAGING_RESOURCE src_bind;
-        uint32_t bytes_per_row, bytes_per_image;
-        if (!staging_src->UseCopySource(SrcSubresource, currentChunkId,
-                                        &src_bind, &bytes_per_row,
-                                        &bytes_per_image))
-          return;
-        EmitBlitCommand<true>(
-            [dst_ = dst->UseBindable(currentChunkId),
-             src = Obj(src_bind.Buffer), bytes_per_row, DstSubresource, DstX,
-             DstY, DstZ, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
-              auto dst = dst_.texture(&ctx);
-              auto dst_mips = dst->mipmapLevelCount();
-              auto dst_level = DstSubresource % dst_mips;
-              auto dst_slice = DstSubresource / dst_mips;
-              // FIXME: offste should be calculated from SrcBox
-              encoder->copyFromBuffer(
-                  src, 0, bytes_per_row, 0,
-                  MTL::Size::Make(SrcBox.right - SrcBox.left, 1, 1), dst,
-                  dst_slice, dst_level, MTL::Origin::Make(DstX, DstY, DstZ));
-            });
-      } else if (auto src = com_cast<IMTLBindable>(pSrcResource)) {
-        // on-device copy
-        EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
-                               src_ = src->UseBindable(currentChunkId),
-                               DstSubresource, SrcSubresource, DstX, DstY, DstZ,
-                               SrcBox](MTL::BlitCommandEncoder *encoder,
-                                       auto &ctx) {
-          auto src = src_.texture(&ctx);
-          auto dst = dst_.texture(&ctx);
-          auto src_mips = src->mipmapLevelCount();
-          auto src_level = SrcSubresource % src_mips;
-          auto src_slice = SrcSubresource / src_mips;
-          auto dst_mips = dst->mipmapLevelCount();
-          auto dst_level = DstSubresource % dst_mips;
-          auto dst_slice = DstSubresource / dst_mips;
-          if (Forget_sRGB(src->pixelFormat()) !=
-              Forget_sRGB(dst->pixelFormat())) {
-            ERR("Texture1D format mismatch! src: ", src->pixelFormat(),
-                ", dst ", dst->pixelFormat());
-            return;
-          }
-          encoder->copyFromTexture(
-              src, src_slice, src_level, MTL::Origin::Make(SrcBox.left, 0, 0),
-              MTL::Size::Make(SrcBox.right - SrcBox.left, 1, 1), dst, dst_slice,
-              dst_level, MTL::Origin::Make(DstX, DstY, DstZ));
-        });
-      } else {
-        D3D11_ASSERT(0 && "todo");
-      }
-    } else {
-      D3D11_ASSERT(0 && "todo");
     }
+    return CopyTextureBitcast(std::move(cmd));
   }
 
-  void CopyTexture2D(ID3D11Texture2D *pDstResource, uint32_t DstSubresource,
-                     uint32_t DstX, uint32_t DstY, uint32_t DstZ,
-                     ID3D11Texture2D *pSrcResource, uint32_t SrcSubresource,
-                     const D3D11_BOX *pSrcBox) {
-    D3D11_TEXTURE2D_DESC dst_desc;
-    D3D11_TEXTURE2D_DESC src_desc;
-    pDstResource->GetDesc(&dst_desc);
-    pSrcResource->GetDesc(&src_desc);
-    auto src_width =
-        std::max(1u, src_desc.Width >> (SrcSubresource % src_desc.MipLevels));
-    auto src_height =
-        std::max(1u, src_desc.Height >> (SrcSubresource % src_desc.MipLevels));
-    auto dst_width =
-        std::max(1u, dst_desc.Width >> (DstSubresource % dst_desc.MipLevels));
-    auto dst_height =
-        std::max(1u, dst_desc.Height >> (DstSubresource % dst_desc.MipLevels));
-    D3D11_BOX SrcBox;
-    if (pSrcBox) {
-      SrcBox = *pSrcBox;
-    } else {
-      SrcBox.left = 0;
-      SrcBox.top = 0;
-      SrcBox.right = src_width;
-      SrcBox.bottom = src_height;
-    }
-    // !HACK: just make validation layer happy
-    // all block compression format should be properly handled later
-    if (src_desc.Format == DXGI_FORMAT_BC7_UNORM_SRGB ||
-        src_desc.Format == DXGI_FORMAT_BC7_UNORM ||
-        src_desc.Format == DXGI_FORMAT_BC7_TYPELESS) {
-      SrcBox.right = align(SrcBox.right, 4u);
-      SrcBox.bottom = align(SrcBox.bottom, 4u);
-    }
-    if (SrcBox.right <= SrcBox.left || SrcBox.bottom <= SrcBox.top)
-      return;
+  void CopyTextureBitcast(TextureCopyCommand &&cmd) {
     auto currentChunkId = cmd_queue.CurrentSeqId();
-    if (auto staging_dst = com_cast<IMTLD3D11Staging>(pDstResource)) {
-      if (auto staging_src = com_cast<IMTLD3D11Staging>(pSrcResource)) {
-        D3D11_ASSERT(0 && "tod: copy between staging");
-      } else if (auto src = com_cast<IMTLBindable>(pSrcResource)) {
+    if (auto staging_dst = com_cast<IMTLD3D11Staging>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
+        D3D11_ASSERT(0 && "TODO: copy between staging");
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
         // copy from device to staging
         MTL_STAGING_RESOURCE dst_bind;
         uint32_t bytes_per_row, bytes_per_image;
-        if (!staging_dst->UseCopyDestination(DstSubresource, currentChunkId,
+        if (!staging_dst->UseCopyDestination(cmd.DstSubresource, currentChunkId,
                                              &dst_bind, &bytes_per_row,
                                              &bytes_per_image))
           return;
         EmitBlitCommand<true>(
             [src_ = src->UseBindable(currentChunkId),
-             dst = Obj(dst_bind.Buffer), bytes_per_row, SrcSubresource, DstX,
-             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
+             dst = Obj(dst_bind.Buffer), bytes_per_row, bytes_per_image,
+             cmd = std::move(cmd)](MTL::BlitCommandEncoder *encoder,
+                                   auto &ctx) {
               auto src = src_.texture(&ctx);
-              auto src_mips = src->mipmapLevelCount();
-              auto src_level = SrcSubresource % src_mips;
-              auto src_slice = SrcSubresource / src_mips;
-              D3D11_ASSERT(DstX == 0);
-              D3D11_ASSERT(DstY == 0);
-              encoder->copyFromTexture(
-                  src, src_slice, src_level,
-                  MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
-                  MTL::Size::Make(SrcBox.right - SrcBox.left,
-                                  SrcBox.bottom - SrcBox.top, 1),
-                  dst.ptr(), /* offset */ 0, bytes_per_row, 0);
-              // offset should be DstY*bytes_per_row + DstX*BytesPerTexel
-            });
+              // auto offset = DstOrigin.z * bytes_per_image +
+              //               DstOrigin.y * bytes_per_row +
+              //               DstOrigin.x * bytes_per_texel;
+              encoder->copyFromTexture(src, cmd.Src.ArraySlice,
+                                       cmd.Src.MipLevel, cmd.SrcOrigin,
+                                       cmd.SrcSize, dst.ptr(), 0 /* offset */,
+                                       bytes_per_row, bytes_per_image);
+            },
+            ContextInternal::CommandBufferState::ReadbackBlitEncoderActive);
         promote_flush = true;
       } else {
-        D3D11_ASSERT(0 && "todo");
+        D3D11_ASSERT(0 && "TODO: copy from dynamic to staging");
       }
-    } else if (dst_desc.Usage == D3D11_USAGE_DEFAULT) {
-      auto dst = com_cast<IMTLBindable>(pDstResource);
-      D3D11_ASSERT(dst);
-      if (auto staging_src = com_cast<IMTLD3D11Staging>(pSrcResource)) {
+    } else if (auto dst = com_cast<IMTLBindable>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
         // copy from staging to default
         MTL_STAGING_RESOURCE src_bind;
         uint32_t bytes_per_row, bytes_per_image;
-        if (!staging_src->UseCopySource(SrcSubresource, currentChunkId,
+        if (!staging_src->UseCopySource(cmd.SrcSubresource, currentChunkId,
                                         &src_bind, &bytes_per_row,
                                         &bytes_per_image))
           return;
 
-        SrcBox.right = std::min(SrcBox.right, dst_width - DstX + SrcBox.left);
-        SrcBox.bottom = std::min(SrcBox.bottom, dst_height - DstY + SrcBox.top);
-        EmitBlitCommand<true>(
-            [dst_ = dst->UseBindable(currentChunkId),
-             src = Obj(src_bind.Buffer), bytes_per_row, DstSubresource, DstX,
-             DstY, SrcBox](MTL::BlitCommandEncoder *encoder, auto &ctx) {
-              auto dst = dst_.texture(&ctx);
-              auto dst_mips = dst->mipmapLevelCount();
-              auto dst_level = DstSubresource % dst_mips;
-              auto dst_slice = DstSubresource / dst_mips;
-              D3D11_ASSERT(DstX == 0);
-              D3D11_ASSERT(DstY == 0);
-              // FIXME: offste should be calculated from SrcBox
-              encoder->copyFromBuffer(
-                  src, 0, bytes_per_row, 0,
-                  MTL::Size::Make(SrcBox.right - SrcBox.left,
-                                  SrcBox.bottom - SrcBox.top, 1),
-                  dst, dst_slice, dst_level, MTL::Origin::Make(DstX, DstY, 0));
-            });
-      } else if (auto src = com_cast<IMTLBindable>(pSrcResource)) {
+        EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
+                               src = Obj(src_bind.Buffer), bytes_per_row,
+                               bytes_per_image, cmd = std::move(cmd)](
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
+          auto dst = dst_.texture(&ctx);
+          // auto offset = SrcBox.front * bytes_per_image +
+          //               SrcBox.top * bytes_per_row +
+          //               SrcBox.left * bytes_per_texel;
+          encoder->copyFromBuffer(
+              src, 0 /* offset */, bytes_per_row, bytes_per_image, cmd.SrcSize,
+              dst, cmd.Dst.ArraySlice, cmd.Dst.MipLevel, cmd.DstOrigin);
+        });
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
         // on-device copy
         EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
                                src_ = src->UseBindable(currentChunkId),
-                               DstSubresource, SrcSubresource, DstX, DstY, DstZ,
-                               SrcBox, currentChunkId](
+                               cmd = std::move(cmd), currentChunkId](
                                   MTL::BlitCommandEncoder *encoder, auto &ctx) {
           auto src = src_.texture(&ctx);
           auto dst = dst_.texture(&ctx);
-          auto src_mips = src->mipmapLevelCount();
           auto src_format = src->pixelFormat();
-          auto src_level = SrcSubresource % src_mips;
-          auto src_slice = SrcSubresource / src_mips;
-          auto dst_mips = dst->mipmapLevelCount();
-          auto dst_level = DstSubresource % dst_mips;
-          auto dst_slice = DstSubresource / dst_mips;
           auto dst_format = dst->pixelFormat();
           if (Forget_sRGB(dst_format) != Forget_sRGB(src_format)) {
-            if (IsBlockCompressionFormat(dst_format) &&
-                FormatBytesPerTexel(src_format) ==
-                    FormatBytesPerTexel(dst_format)) {
-              auto bytes_per_row = (SrcBox.right - SrcBox.left) *
-                                   FormatBytesPerTexel(src_format);
-              auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
-                  currentChunkId, bytes_per_row * (SrcBox.bottom - SrcBox.top),
-                  16);
-              encoder->copyFromTexture(
-                  src, src_slice, src_level,
-                  MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
-                  MTL::Size::Make(SrcBox.right - SrcBox.left,
-                                  SrcBox.bottom - SrcBox.top, 1),
-                  buffer, offset, bytes_per_row, 0);
-              encoder->copyFromBuffer(
-                  buffer, offset, bytes_per_row, 0,
-                  MTL::Size::Make((SrcBox.right - SrcBox.left) * 4,
-                                  (SrcBox.bottom - SrcBox.top) * 4, 1),
-                  dst, dst_slice, dst_level,
-                  MTL::Origin::Make(DstX, DstY, DstZ));
-              return;
+            // bitcast, using a temporary buffer
+            size_t bytes_per_row, bytes_per_image, bytes_total;
+            if (cmd.SrcFormat.IsCompressed) {
+              bytes_per_row = (align(cmd.SrcSize.width, 4u) >> 2) *
+                              cmd.SrcFormat.BytesPerTexel;
+              bytes_per_image =
+                  bytes_per_row * (align(cmd.SrcSize.height, 4u) >> 2);
+            } else {
+              bytes_per_row = cmd.SrcSize.width * cmd.SrcFormat.BytesPerTexel;
+              bytes_per_image = bytes_per_row * cmd.SrcSize.height;
             }
-            if (IsBlockCompressionFormat(src_format) &&
-                FormatBytesPerTexel(src_format) ==
-                    FormatBytesPerTexel(dst_format)) {
-              D3D11_ASSERT((align((SrcBox.right - SrcBox.left), 4) ==
-                            (SrcBox.right - SrcBox.left)));
-              D3D11_ASSERT((align((SrcBox.bottom - SrcBox.top), 4) ==
-                            (SrcBox.bottom - SrcBox.top)));
-              auto block_w = ((SrcBox.right - SrcBox.left) >> 2);
-              auto block_h = ((SrcBox.bottom - SrcBox.top) >> 2);
-              auto bytes_per_row = block_w * FormatBytesPerTexel(src_format);
-              auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
-                  currentChunkId, bytes_per_row * block_h, 16);
-              encoder->copyFromTexture(
-                  src, src_slice, src_level,
-                  MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
-                  MTL::Size::Make(SrcBox.right - SrcBox.left,
-                                  SrcBox.bottom - SrcBox.top, 1),
-                  buffer, offset, bytes_per_row, 0);
-              encoder->copyFromBuffer(buffer, offset, bytes_per_row, 0,
-                                      MTL::Size::Make(block_w, block_h, 1), dst,
-                                      dst_slice, dst_level,
-                                      MTL::Origin::Make(DstX, DstY, DstZ));
-              return;
-            }
-            if (FormatBytesPerTexel(src_format) ==
-                FormatBytesPerTexel(dst_format)) {
-              // FIXME: very broken
-              auto width = (SrcBox.right - SrcBox.left);
-              auto height = (SrcBox.bottom - SrcBox.top);
-              auto bytes_per_row = width * FormatBytesPerTexel(src_format);
-              auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
-                  currentChunkId, bytes_per_row * height, 16);
-              encoder->copyFromTexture(
-                  src, src_slice, src_level,
-                  MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
-                  MTL::Size::Make(width, height, 1), buffer, offset,
-                  bytes_per_row, 0);
-              encoder->copyFromBuffer(buffer, offset, bytes_per_row, 0,
-                                      MTL::Size::Make(width, height, 1), dst,
-                                      dst_slice, dst_level,
-                                      MTL::Origin::Make(DstX, DstY, DstZ));
-              return;
-            }
-
-            ERR("Texture2D format mismatch! src: ", src_format, ", dst ",
-                dst_format);
+            bytes_total = bytes_per_image * cmd.SrcSize.depth;
+            auto [_, buffer, offset] =
+                ctx.queue->AllocateTempBuffer(currentChunkId, bytes_total, 16);
+            encoder->copyFromTexture(src, cmd.Src.ArraySlice, cmd.Src.MipLevel,
+                                     cmd.SrcOrigin, cmd.SrcSize, buffer, offset,
+                                     bytes_per_row, bytes_per_image);
+            encoder->copyFromBuffer(
+                buffer, offset, bytes_per_row, bytes_per_image, cmd.SrcSize,
+                dst, cmd.Dst.ArraySlice, cmd.Dst.MipLevel, cmd.DstOrigin);
             return;
           }
-          encoder->copyFromTexture(
-              src, src_slice, src_level,
-              MTL::Origin::Make(SrcBox.left, SrcBox.top, 0),
-              MTL::Size::Make(SrcBox.right - SrcBox.left,
-                              SrcBox.bottom - SrcBox.top, 1),
-              dst, dst_slice, dst_level, MTL::Origin::Make(DstX, DstY, DstZ));
+          encoder->copyFromTexture(src, cmd.Src.ArraySlice, cmd.Src.MipLevel,
+                                   cmd.SrcOrigin, cmd.SrcSize, dst,
+                                   cmd.Dst.ArraySlice, cmd.Dst.MipLevel,
+                                   cmd.DstOrigin);
         });
       } else {
-        D3D11_ASSERT(0 && "todo");
+        D3D11_ASSERT(0 && "TODO: copy from dynamic to device");
       }
     } else {
-      D3D11_ASSERT(0 && "todo");
+      D3D11_ASSERT(0 && "TODO: copy to dynamic?");
+    }
+  }
+
+  void CopyTextureFromCompressed(TextureCopyCommand &&cmd) {
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    if (auto staging_dst = com_cast<IMTLD3D11Staging>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
+        D3D11_ASSERT(0 && "TODO: copy between staging (from compressed)");
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
+        D3D11_ASSERT(0 && "TODO: copy from compressed device to staging");
+      } else {
+        D3D11_ASSERT(0 && "TODO: copy from compressed dynamic to staging");
+      }
+    } else if (auto dst = com_cast<IMTLBindable>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
+        // copy from staging to default
+        D3D11_ASSERT(0 && "TODO: copy from compressed staging to default");
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
+        // on-device copy
+        EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
+                               src_ = src->UseBindable(currentChunkId),
+                               cmd = std::move(cmd), currentChunkId](
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
+          auto src = src_.texture(&ctx);
+          auto dst = dst_.texture(&ctx);
+          auto block_w = (align(cmd.SrcSize.width, 4u) >> 2);
+          auto block_h = (align(cmd.SrcSize.height, 4u) >> 2);
+          auto bytes_per_row = block_w * cmd.SrcFormat.BytesPerTexel;
+          auto bytes_per_image = bytes_per_row * block_h;
+          auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
+              currentChunkId, bytes_per_image * cmd.SrcSize.depth, 16);
+          encoder->copyFromTexture(src, cmd.Src.ArraySlice, cmd.Src.MipLevel,
+                                   cmd.SrcOrigin, cmd.SrcSize, buffer, offset,
+                                   bytes_per_row, bytes_per_image);
+          encoder->copyFromBuffer(
+              buffer, offset, bytes_per_row, bytes_per_image,
+              MTL::Size::Make(block_w, block_h, cmd.SrcSize.depth), dst,
+              cmd.Dst.ArraySlice, cmd.Dst.MipLevel, cmd.DstOrigin);
+          return;
+        });
+      } else {
+        D3D11_ASSERT(0 && "TODO: copy from compressed dynamic to device");
+      }
+    } else {
+      D3D11_ASSERT(0 && "TODO: copy from compressed ? to dynamic");
+    }
+  }
+
+  void CopyTextureToCompressed(TextureCopyCommand &&cmd) {
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    if (auto staging_dst = com_cast<IMTLD3D11Staging>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
+        D3D11_ASSERT(0 && "TODO: copy between staging (to compressed)");
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
+        D3D11_ASSERT(0 && "TODO: copy from device to compressed staging");
+      } else {
+        D3D11_ASSERT(0 && "TODO: copy from dynamic to compressed staging");
+      }
+    } else if (auto dst = com_cast<IMTLBindable>(cmd.pDst)) {
+      if (auto staging_src = com_cast<IMTLD3D11Staging>(cmd.pSrc)) {
+        // copy from staging to default
+        D3D11_ASSERT(0 && "TODO: copy from staging to compressed default");
+      } else if (auto src = com_cast<IMTLBindable>(cmd.pSrc)) {
+        // on-device copy
+        EmitBlitCommand<true>([dst_ = dst->UseBindable(currentChunkId),
+                               src_ = src->UseBindable(currentChunkId),
+                               cmd = std::move(cmd), currentChunkId](
+                                  MTL::BlitCommandEncoder *encoder, auto &ctx) {
+          auto src = src_.texture(&ctx);
+          auto dst = dst_.texture(&ctx);
+          auto bytes_per_row = cmd.SrcSize.width * cmd.SrcFormat.BytesPerTexel;
+          auto bytes_per_image = cmd.SrcSize.height * bytes_per_row;
+          auto [_, buffer, offset] = ctx.queue->AllocateTempBuffer(
+              currentChunkId, bytes_per_image * cmd.SrcSize.depth, 16);
+          encoder->copyFromTexture(src, cmd.Src.ArraySlice, cmd.Src.MipLevel,
+                                   cmd.SrcOrigin, cmd.SrcSize, buffer, offset,
+                                   bytes_per_row, bytes_per_image);
+          auto clamped_src_width = std::min(
+              cmd.SrcSize.width << 2,
+              std::max<uint32_t>(dst->width() >> cmd.Dst.MipLevel, 1u) -
+                  cmd.DstOrigin.x);
+          auto clamped_src_height = std::min(
+              cmd.SrcSize.height << 2,
+              std::max<uint32_t>(dst->height() >> cmd.Dst.MipLevel, 1u) -
+                  cmd.DstOrigin.y);
+          encoder->copyFromBuffer(
+              buffer, offset, bytes_per_row, bytes_per_image,
+              MTL::Size::Make(clamped_src_width, clamped_src_height,
+                              cmd.SrcSize.depth),
+              dst, cmd.Dst.ArraySlice, cmd.Dst.MipLevel, cmd.DstOrigin);
+          return;
+        });
+      } else {
+        D3D11_ASSERT(0 && "TODO: copy from dynamic to compressed device");
+      }
+    } else {
+      D3D11_ASSERT(0 && "TODO: copy to compressed dynamic");
+    }
+  }
+
+  void UpdateTexture(TextureUpdateCommand &&cmd, const void *pSrcData,
+                     UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags) {
+    if (cmd.Invalid)
+      return;
+
+    if (auto bindable = com_cast<IMTLBindable>(cmd.pDst)) {
+      while (!bindable->GetContentionState(cmd_queue.CoherentSeqId())) {
+        auto dst = bindable->UseBindable(cmd_queue.CurrentSeqId());
+        auto texture = dst.texture();
+        if (!texture)
+          break;
+        texture->replaceRegion(cmd.DstRegion, cmd.Dst.MipLevel,
+                               cmd.Dst.ArraySlice, pSrcData, SrcRowPitch,
+                               SrcDepthPitch);
+        return;
+      }
+      auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
+      auto [ptr, staging_buffer, offset] = cmd_queue.AllocateStagingBuffer(
+          bytes_per_depth_slice * cmd.DstRegion.size.depth, 16);
+      if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
+        for (unsigned depthSlice = 0; depthSlice < cmd.DstRegion.size.depth;
+             depthSlice++) {
+          char *dst = ((char *)ptr) + depthSlice * bytes_per_depth_slice;
+          const char *src =
+              ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
+          memcpy(dst, src, bytes_per_depth_slice);
+        }
+      } else {
+        for (unsigned depthSlice = 0; depthSlice < cmd.DstRegion.size.depth;
+             depthSlice++) {
+          for (unsigned row = 0; row < cmd.EffectiveRows; row++) {
+            char *dst = ((char *)ptr) + row * cmd.EffectiveBytesPerRow +
+                        depthSlice * bytes_per_depth_slice;
+            const char *src = ((const char *)pSrcData) + row * SrcRowPitch +
+                              depthSlice * SrcDepthPitch;
+            memcpy(dst, src, cmd.EffectiveBytesPerRow);
+          }
+        }
+      }
+      EmitBlitCommand<true>(
+          [staging_buffer, offset,
+           dst = bindable->UseBindable(cmd_queue.CurrentSeqId()),
+           cmd = std::move(cmd),
+           bytes_per_depth_slice](MTL::BlitCommandEncoder *enc, auto &ctx) {
+            enc->copyFromBuffer(
+                staging_buffer, offset, cmd.EffectiveBytesPerRow,
+                bytes_per_depth_slice, cmd.DstRegion.size, dst.texture(&ctx),
+                cmd.Dst.ArraySlice, cmd.Dst.MipLevel, cmd.DstRegion.origin);
+          },
+          ContextInternal::CommandBufferState::UpdateBlitEncoderActive);
+    } else if (auto dynamic = com_cast<IMTLDynamicBindable>(cmd.pDst)) {
+      D3D11_ASSERT(CopyFlags && "otherwise resource cannot be dynamic");
+      D3D11_ASSERT(0 && "TODO: UpdateSubresource1: update dynamic texture");
+    } else if (auto staging_dst = com_cast<IMTLD3D11Staging>(cmd.pDst)) {
+      // staging: ...
+      D3D11_ASSERT(0 && "TODO: UpdateSubresource1: update staging texture");
+    } else {
+      D3D11_ASSERT(0 && "TODO: UpdateSubresource1: unknown texture");
     }
   }
 
@@ -886,7 +1209,8 @@ public:
     case CommandBufferState::Idle:
       break;
     case CommandBufferState::RenderEncoderActive:
-    case CommandBufferState::RenderPipelineReady: {
+    case CommandBufferState::RenderPipelineReady:
+    case CommandBufferState::TessellationRenderPipelineReady: {
       chk->emit([](CommandChunk::context &ctx) {
         ctx.render_encoder->endEncoding();
         ctx.render_encoder = nullptr;
@@ -902,6 +1226,8 @@ public:
         ctx.compute_encoder = nullptr;
       });
       break;
+    case CommandBufferState::UpdateBlitEncoderActive:
+    case CommandBufferState::ReadbackBlitEncoderActive:
     case CommandBufferState::BlitEncoderActive:
       chk->emit([](CommandChunk::context &ctx) {
         ctx.blit_encoder->endEncoding();
@@ -929,7 +1255,8 @@ public:
   -
   */
   void InvalidateRenderPipeline() {
-    if (cmdbuf_state != CommandBufferState::RenderPipelineReady)
+    if (cmdbuf_state != CommandBufferState::RenderPipelineReady &&
+        cmdbuf_state != CommandBufferState::TessellationRenderPipelineReady)
       return;
     cmdbuf_state = CommandBufferState::RenderEncoderActive;
   }
@@ -954,16 +1281,21 @@ public:
         return;
       }
       auto pool = transfer(NS::AutoreleasePool::alloc()->init());
-      auto enc_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
-      for (unsigned i = 0; i < clear_pass->num_color_attachments; i++) {
-        auto attachmentz = enc_descriptor->colorAttachments()->object(i);
-        attachmentz->setClearColor(clear_pass->clear_colors[i]);
+      unsigned index = clear_pass->num_color_attachments;
+      while (index--) {
+        auto enc_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto attachmentz = enc_descriptor->colorAttachments()->object(0);
+        attachmentz->setClearColor(clear_pass->clear_colors[index]);
         attachmentz->setTexture(
-            clear_pass->clear_color_attachments[i].texture(&ctx));
+            clear_pass->clear_color_attachments[index].texture(&ctx));
         attachmentz->setLoadAction(MTL::LoadActionClear);
         attachmentz->setStoreAction(MTL::StoreActionStore);
+        auto enc = ctx.cmdbuf->renderCommandEncoder(enc_descriptor);
+        enc->setLabel(NS::String::string("ClearPass", NS::ASCIIStringEncoding));
+        enc->endEncoding();
       }
       if (clear_pass->depth_stencil_flags) {
+        auto enc_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
         MTL::Texture *texture =
             clear_pass->clear_depth_stencil_attachment.texture(&ctx);
         uint32_t planar_flags = DepthStencilPlanarFlags(texture->pixelFormat());
@@ -983,21 +1315,14 @@ public:
           attachmentz->setLoadAction(MTL::LoadActionClear);
           attachmentz->setStoreAction(MTL::StoreActionStore);
         }
-      }
-
-      if (clear_pass->num_color_attachments == 0) {
-        if (clear_pass->depth_stencil_flags == 0) {
-          return;
-        }
-        auto texture = clear_pass->clear_depth_stencil_attachment.texture(&ctx);
         enc_descriptor->setRenderTargetHeight(texture->height());
         enc_descriptor->setRenderTargetWidth(texture->width());
         enc_descriptor->setDefaultRasterSampleCount(1);
+        auto enc = ctx.cmdbuf->renderCommandEncoder(enc_descriptor);
+        enc->setLabel(NS::String::string("ClearDepthPass", NS::ASCIIStringEncoding));
+        enc->endEncoding();
       }
 
-      auto enc = ctx.cmdbuf->renderCommandEncoder(enc_descriptor);
-      enc->setLabel(NS::String::string("ClearPass", NS::ASCIIStringEncoding));
-      enc->endEncoding();
     });
   };
 
@@ -1007,12 +1332,13 @@ public:
 
     auto rtv_props = pRenderTargetView->GetRenderTargetProps();
     if (rtv_props->RenderTargetArrayLength > 0) {
-      // FIXME: definitely texture3d?
       EmitComputeCommandChk<true>(
           [texture = pRenderTargetView->GetBinding(cmd_queue.CurrentSeqId()),
            clear_color =
                std::array<float, 4>({ColorRGBA[0], ColorRGBA[1], ColorRGBA[2],
                                      ColorRGBA[3]})](auto encoder, auto &ctx) {
+            D3D11_ASSERT(texture.texture(&ctx)->textureType() ==
+                         MTL::TextureType3D);
             ctx.queue->clear_cmd.ClearTexture3DFloat(
                 encoder, texture.texture(&ctx), clear_color);
           });
@@ -1058,6 +1384,7 @@ public:
     auto target = pDepthStencilView->GetBinding(cmd_queue.CurrentSeqId());
 
     auto previous_encoder = chk->get_last_encoder();
+    bool inherit_rtvs_from_previous_encoder = false;
     // use `while` instead of `if`, for short circuiting
     while (previous_encoder->kind == EncoderKind::ClearPass) {
       auto previous_clearpass = (ENCODER_CLEARPASS_INFO *)previous_encoder;
@@ -1076,6 +1403,7 @@ public:
           return;
         }
         // otherwise we must create a new clearpass
+        inherit_rtvs_from_previous_encoder = true;
         break;
       }
       // no depth stencil attachment, just set it
@@ -1098,6 +1426,17 @@ public:
     }
     if (ClearFlags & D3D11_CLEAR_STENCIL) {
       clear_pass->clear_stencil = Stencil;
+    }
+    if (inherit_rtvs_from_previous_encoder) {
+      auto previous_clearpass = (ENCODER_CLEARPASS_INFO *)previous_encoder;
+      clear_pass->num_color_attachments =
+          previous_clearpass->num_color_attachments;
+      for (unsigned i = 0; i < clear_pass->num_color_attachments; i++) {
+        clear_pass->clear_colors[i] = previous_clearpass->clear_colors[i];
+        clear_pass->clear_color_attachments[i] =
+            std::move(previous_clearpass->clear_color_attachments[i]);
+        previous_clearpass->num_color_attachments = 0;
+      }
     }
     EncodeClearPass(clear_pass);
   }
@@ -1143,6 +1482,8 @@ public:
   */
   bool SwitchToRenderEncoder() {
     if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
+      return true;
+    if (cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady)
       return true;
     if (cmdbuf_state == CommandBufferState::RenderEncoderActive)
       return true;
@@ -1207,12 +1548,27 @@ public:
       };
       // auto &dsv = state_.OutputMerger.DSV;
       DEPTH_STENCIL_STATE dsv_info;
+      uint32_t uav_only_render_target_width = 0;
+      uint32_t uav_only_render_target_height = 0;
+      bool uav_only = false;
+      uint32_t uav_only_sample_count = 0;
       if (state_.OutputMerger.DSV) {
         dsv_info.Texture = state_.OutputMerger.DSV->GetBinding(currentChunkId);
         dsv_info.PixelFormat = state_.OutputMerger.DSV->GetPixelFormat();
       } else if (effective_render_target == 0) {
-        // FIXME: No-Rasterization Stream-Out Pipeline
-        return false;
+        if (state_.OutputMerger.NumRTVs) {
+          return false;
+        }
+        D3D11_ASSERT(state_.Rasterizer.NumViewports);
+        IMTLD3D11RasterizerState *state =
+            state_.Rasterizer.RasterizerState
+                ? state_.Rasterizer.RasterizerState
+                : default_rasterizer_state;
+        auto &viewport = state_.Rasterizer.viewports[0];
+        uav_only_render_target_width = viewport.Width;
+        uav_only_render_target_height = viewport.Height;
+        uav_only_sample_count = state->UAVOnlySampleCount();
+        uav_only = true;
       }
 
       auto previous_encoder = chk->get_last_encoder();
@@ -1262,7 +1618,7 @@ public:
           auto remain_clearpass = chk->mark_clear_pass();
           for (unsigned i = 0; i < previous_clearpass->num_color_attachments;
                i++) {
-            if (skip_clear_color_mask | (1 << i))
+            if (skip_clear_color_mask & (1 << i))
               continue;
             auto j = remain_clearpass->num_color_attachments;
             remain_clearpass->num_color_attachments++;
@@ -1285,12 +1641,14 @@ public:
         }
       };
 
-      chk->mark_pass(EncoderKind::Render);
+      auto pass_info = chk->mark_render_pass();
 
       auto bump_offset = NextOcclusionQuerySeq() % kOcclusionSampleCount;
 
       chk->emit([rtvs = std::move(rtvs), dsv = std::move(dsv_info), bump_offset,
-                 effective_render_target](CommandChunk::context &ctx) {
+                 effective_render_target, uav_only,
+                 uav_only_render_target_height, uav_only_render_target_width,
+                 uav_only_sample_count, pass_info](CommandChunk::context &ctx) {
         auto pool = transfer(NS::AutoreleasePool::alloc()->init());
         auto renderPassDescriptor =
             MTL::RenderPassDescriptor::renderPassDescriptor();
@@ -1336,10 +1694,19 @@ public:
           }
         }
         if (effective_render_target == 0) {
-          D3D11_ASSERT(dsv_planar_flags);
-          auto dsv_tex = dsv.Texture.texture(&ctx);
-          renderPassDescriptor->setRenderTargetHeight(dsv_tex->height());
-          renderPassDescriptor->setRenderTargetWidth(dsv_tex->width());
+          if (uav_only) {
+            renderPassDescriptor->setRenderTargetHeight(
+                uav_only_render_target_height);
+            renderPassDescriptor->setRenderTargetWidth(
+                uav_only_render_target_width);
+            renderPassDescriptor->setDefaultRasterSampleCount(
+                uav_only_sample_count);
+          } else {
+            D3D11_ASSERT(dsv_planar_flags);
+            auto dsv_tex = dsv.Texture.texture(&ctx);
+            renderPassDescriptor->setRenderTargetHeight(dsv_tex->height());
+            renderPassDescriptor->setRenderTargetWidth(dsv_tex->width());
+          }
         }
         renderPassDescriptor->setVisibilityResultBuffer(
             ctx.chk->visibility_result_heap);
@@ -1348,10 +1715,18 @@ public:
         auto [h, _] = ctx.chk->inspect_gpu_heap();
         ctx.dsv_planar_flags = dsv_planar_flags;
         D3D11_ASSERT(ctx.render_encoder);
+        ctx.render_encoder->setVertexBuffer(h, 0, 16);
         ctx.render_encoder->setVertexBuffer(h, 0, 29);
         ctx.render_encoder->setVertexBuffer(h, 0, 30);
         ctx.render_encoder->setFragmentBuffer(h, 0, 29);
         ctx.render_encoder->setFragmentBuffer(h, 0, 30);
+        if (pass_info->tessellation_pass) {
+          ctx.render_encoder->setMeshBuffer(h, 0, 29);
+          ctx.render_encoder->setMeshBuffer(h, 0, 30);
+          ctx.render_encoder->setObjectBuffer(h, 0, 16);
+          ctx.render_encoder->setObjectBuffer(h, 0, 29);
+          ctx.render_encoder->setObjectBuffer(h, 0, 30);
+        }
         // TODO: need to check if there is any query in building
         ctx.render_encoder->setVisibilityResultMode(
             MTL::VisibilityResultModeCounting, bump_offset << 3);
@@ -1365,8 +1740,8 @@ public:
   /**
   Switch to blit encoder
   */
-  void SwitchToBlitEncoder() {
-    if (cmdbuf_state == CommandBufferState::BlitEncoderActive)
+  void SwitchToBlitEncoder(CommandBufferState BlitKind) {
+    if (cmdbuf_state == BlitKind)
       return;
     InvalidateCurrentPass();
 
@@ -1381,7 +1756,7 @@ public:
       });
     }
 
-    cmdbuf_state = CommandBufferState::BlitEncoderActive;
+    cmdbuf_state = BlitKind;
   }
 
   /**
@@ -1416,6 +1791,7 @@ public:
     cmdbuf_state = CommandBufferState::ComputeEncoderActive;
   }
 
+  template<bool IndexedDraw>
   bool FinalizeNoRasterizationRenderPipeline(IMTLD3D11Shader *pVertexShader) {
 
     if (!SwitchToRenderEncoder()) {
@@ -1426,23 +1802,27 @@ public:
 
     Com<IMTLCompiledGraphicsPipeline> pipeline;
     Com<IMTLCompiledShader> vs;
-    if (state_.InputAssembler.InputLayout &&
-        state_.InputAssembler.InputLayout->NeedsFixup()) {
-      MTL_SHADER_INPUT_LAYOUT_FIXUP fixup;
-      state_.InputAssembler.InputLayout->GetShaderFixupInfo(&fixup);
-      pVertexShader->GetCompiledShaderWithInputLayerFixup(fixup.sign_mask, &vs);
-    } else {
-      pVertexShader->GetCompiledShader(&vs);
-    }
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
-    pipelineDesc.VertexShader = vs.ptr();
+    pipelineDesc.VertexShader = pVertexShader;
     pipelineDesc.PixelShader = nullptr;
-    pipelineDesc.InputLayout = state_.InputAssembler.InputLayout.ptr();
+    pipelineDesc.HullShader = nullptr;
+    pipelineDesc.DomainShader = nullptr;
+    pipelineDesc.InputLayout = state_.InputAssembler.InputLayout;
     pipelineDesc.NumColorAttachments = 0;
-    memset(pipelineDesc.ColorAttachmentFormats, 0, sizeof(pipelineDesc.ColorAttachmentFormats));
-    pipelineDesc.BlendState = nullptr;
+    memset(pipelineDesc.ColorAttachmentFormats, 0,
+           sizeof(pipelineDesc.ColorAttachmentFormats));
+    pipelineDesc.BlendState = default_blend_state;
     pipelineDesc.DepthStencilFormat = MTL::PixelFormatInvalid;
     pipelineDesc.RasterizationEnabled = false;
+    pipelineDesc.SampleMask = D3D11_DEFAULT_SAMPLE_MASK;
+    if constexpr (IndexedDraw) {
+      pipelineDesc.IndexBufferFormat =
+          state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
+              ? SM50_INDEX_BUFFER_FORMAT_UINT32
+              : SM50_INDEX_BUFFER_FORMAT_UINT16;
+    } else {
+      pipelineDesc.IndexBufferFormat = SM50_INDEX_BUFFER_FORMAT_NONE;
+    }
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
 
@@ -1458,36 +1838,19 @@ public:
     return true;
   };
 
-  /**
-  Assume we have all things needed to build PSO
-  If the current encoder is not a render encoder, switch to it.
-  */
-  bool FinalizeCurrentRenderPipeline() {
-    if (state_.InputAssembler.InputLayout &&
-        !state_.InputAssembler.VertexBuffers.all_bound_masked(
-            state_.InputAssembler.InputLayout->GetInputSlotMask())) {
-      // ERR("missing vertex buffer binding");
-      return false;
-    }
-    if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
+  template<bool IndexedDraw>
+  bool FinalizeTessellationRenderPipeline() {
+
+    if (cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady)
       return true;
-    if (state_.ShaderStages[(UINT)ShaderType::Hull].Shader) {
-      // ERR("tessellation is not supported yet, skip drawcall");
+    if (!state_.ShaderStages[(UINT)ShaderType::Hull].Shader) {
       return false;
     }
-    if (state_.ShaderStages[(UINT)ShaderType::Domain].Shader) {
-      // ERR("tessellation is not supported yet, skip drawcall");
+    if (!state_.ShaderStages[(UINT)ShaderType::Domain].Shader) {
       return false;
     }
     if (state_.ShaderStages[(UINT)ShaderType::Geometry].Shader) {
-      if (!state_.ShaderStages[(UINT)ShaderType::Pixel].Shader) {
-        return FinalizeNoRasterizationRenderPipeline(
-            state_.ShaderStages[(UINT)ShaderType::Geometry].Shader.ptr());
-      }
-      // ERR("geometry shader is not supported yet, skip drawcall");
-      return false;
-    }
-    if (!state_.OutputMerger.NumRTVs && !state_.OutputMerger.DSV) {
+      ERR("tessellation-geometry pipeline is not supported yet, skip drawcall");
       return false;
     }
 
@@ -1497,44 +1860,29 @@ public:
 
     CommandChunk *chk = cmd_queue.CurrentChunk();
 
-    Com<IMTLCompiledGraphicsPipeline> pipeline;
+    auto previous_encoder = chk->get_last_encoder();
+    if (previous_encoder->kind == EncoderKind::Render) {
+      auto previous_clearpass = (ENCODER_RENDER_INFO *)previous_encoder;
+      previous_clearpass->tessellation_pass = 1;
+    }
+
+    Com<IMTLCompiledTessellationPipeline> pipeline;
     Com<IMTLCompiledShader> vs, ps;
-    if (state_.InputAssembler.InputLayout &&
-        state_.InputAssembler.InputLayout->NeedsFixup()) {
-
-      MTL_SHADER_INPUT_LAYOUT_FIXUP fixup;
-      state_.InputAssembler.InputLayout->GetShaderFixupInfo(&fixup);
-      state_.ShaderStages[(UINT)ShaderType::Vertex]
-          .Shader //
-          ->GetCompiledShaderWithInputLayerFixup(fixup.sign_mask, &vs);
-    } else {
-      state_.ShaderStages[(UINT)ShaderType::Vertex]
-          .Shader //
-          ->GetCompiledShader(&vs);
-    }
-
-    if (state_.ShaderStages[(UINT)ShaderType::Pixel].Shader) {
-      if (state_.OutputMerger.SampleMask != 0xffffffff) {
-        // WARN("Emulate SampleMask PSO");
-        state_.ShaderStages[(UINT)ShaderType::Pixel]
-            .Shader //
-            ->GetCompiledPixelShaderWithSampleMask(
-                state_.OutputMerger.SampleMask, &ps);
-      } else {
-        state_.ShaderStages[(UINT)ShaderType::Pixel]
-            .Shader //
-            ->GetCompiledShader(&ps);
-      }
-    }
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
-    pipelineDesc.VertexShader = vs.ptr();
-    pipelineDesc.PixelShader = ps.ptr();
-    pipelineDesc.InputLayout = state_.InputAssembler.InputLayout.ptr();
+    pipelineDesc.VertexShader =
+        state_.ShaderStages[(UINT)ShaderType::Vertex].Shader.ptr();
+    pipelineDesc.PixelShader =
+        state_.ShaderStages[(UINT)ShaderType::Pixel].Shader.ptr();
+    pipelineDesc.HullShader =
+        state_.ShaderStages[(UINT)ShaderType::Hull].Shader.ptr();
+    pipelineDesc.DomainShader =
+        state_.ShaderStages[(UINT)ShaderType::Domain].Shader.ptr();
+    pipelineDesc.InputLayout = state_.InputAssembler.InputLayout;
     pipelineDesc.NumColorAttachments = state_.OutputMerger.NumRTVs;
     for (unsigned i = 0; i < ARRAYSIZE(state_.OutputMerger.RTVs); i++) {
       auto &rtv = state_.OutputMerger.RTVs[i];
-      if (rtv) {
+      if (rtv && i < pipelineDesc.NumColorAttachments) {
         pipelineDesc.ColorAttachmentFormats[i] =
             state_.OutputMerger.RTVs[i]->GetPixelFormat();
       } else {
@@ -1548,6 +1896,99 @@ public:
         state_.OutputMerger.DSV ? state_.OutputMerger.DSV->GetPixelFormat()
                                 : MTL::PixelFormatInvalid;
     pipelineDesc.RasterizationEnabled = true;
+    pipelineDesc.SampleMask = state_.OutputMerger.SampleMask;
+    if constexpr (IndexedDraw) {
+      pipelineDesc.IndexBufferFormat =
+          state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
+              ? SM50_INDEX_BUFFER_FORMAT_UINT32
+              : SM50_INDEX_BUFFER_FORMAT_UINT16;
+    } else {
+      pipelineDesc.IndexBufferFormat = SM50_INDEX_BUFFER_FORMAT_NONE;
+    }
+
+    device->CreateTessellationPipeline(&pipelineDesc, &pipeline);
+
+    chk->emit([pso = std::move(pipeline)](CommandChunk::context &ctx) {
+      MTL_COMPILED_TESSELLATION_PIPELINE GraphicsPipeline{};
+      pso->GetPipeline(&GraphicsPipeline); // may block
+      D3D11_ASSERT(GraphicsPipeline.MeshPipelineState);
+      D3D11_ASSERT(GraphicsPipeline.RasterizationPipelineState);
+      ctx.tess_mesh_pso = GraphicsPipeline.MeshPipelineState;
+      ctx.tess_raster_pso = GraphicsPipeline.RasterizationPipelineState;
+      ctx.tess_num_output_control_point_element =
+          GraphicsPipeline.NumControlPointOutputElement;
+      ctx.tess_num_output_patch_constant_scalar =
+          GraphicsPipeline.NumPatchConstantOutputScalar;
+      ctx.tess_threads_per_patch =
+          GraphicsPipeline.ThreadsPerPatch;
+    });
+
+    cmdbuf_state = CommandBufferState::TessellationRenderPipelineReady;
+    return true;
+  }
+
+  /**
+  Assume we have all things needed to build PSO
+  If the current encoder is not a render encoder, switch to it.
+  */
+  template<bool IndexedDraw>
+  bool FinalizeCurrentRenderPipeline() {
+    if (state_.ShaderStages[(UINT)ShaderType::Hull].Shader) {
+      return FinalizeTessellationRenderPipeline<IndexedDraw>();
+    }
+    if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
+      return true;
+    if (state_.ShaderStages[(UINT)ShaderType::Geometry].Shader) {
+      if (!state_.ShaderStages[(UINT)ShaderType::Pixel].Shader) {
+        return FinalizeNoRasterizationRenderPipeline<IndexedDraw>(
+            state_.ShaderStages[(UINT)ShaderType::Geometry].Shader.ptr());
+      }
+      // ERR("geometry shader is not supported yet, skip drawcall");
+      return false;
+    }
+
+    if (!SwitchToRenderEncoder()) {
+      return false;
+    }
+
+    CommandChunk *chk = cmd_queue.CurrentChunk();
+
+    Com<IMTLCompiledGraphicsPipeline> pipeline;
+
+    MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
+    pipelineDesc.VertexShader = state_.ShaderStages[(UINT)ShaderType::Vertex]
+            .Shader.ptr();
+    pipelineDesc.PixelShader = state_.ShaderStages[(UINT)ShaderType::Pixel]
+            .Shader.ptr();
+    pipelineDesc.HullShader = nullptr;
+    pipelineDesc.DomainShader = nullptr;
+    pipelineDesc.InputLayout = state_.InputAssembler.InputLayout;
+    pipelineDesc.NumColorAttachments = state_.OutputMerger.NumRTVs;
+    for (unsigned i = 0; i < ARRAYSIZE(state_.OutputMerger.RTVs); i++) {
+      auto &rtv = state_.OutputMerger.RTVs[i];
+      if (rtv && i < pipelineDesc.NumColorAttachments) {
+        pipelineDesc.ColorAttachmentFormats[i] =
+            state_.OutputMerger.RTVs[i]->GetPixelFormat();
+      } else {
+        pipelineDesc.ColorAttachmentFormats[i] = MTL::PixelFormatInvalid;
+      }
+    }
+    pipelineDesc.BlendState = state_.OutputMerger.BlendState
+                                   ? state_.OutputMerger.BlendState
+                                   : default_blend_state;
+    pipelineDesc.DepthStencilFormat =
+        state_.OutputMerger.DSV ? state_.OutputMerger.DSV->GetPixelFormat()
+                                : MTL::PixelFormatInvalid;
+    pipelineDesc.RasterizationEnabled = true;
+    pipelineDesc.SampleMask = state_.OutputMerger.SampleMask;
+    if constexpr (IndexedDraw) {
+      pipelineDesc.IndexBufferFormat =
+          state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
+              ? SM50_INDEX_BUFFER_FORMAT_UINT32
+              : SM50_INDEX_BUFFER_FORMAT_UINT16;
+    } else {
+      pipelineDesc.IndexBufferFormat = SM50_INDEX_BUFFER_FORMAT_NONE;
+    }
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
 
@@ -1563,8 +2004,10 @@ public:
     return true;
   }
 
+
+  template<bool IndexedDraw>
   bool PreDraw() {
-    if (!FinalizeCurrentRenderPipeline()) {
+    if (!FinalizeCurrentRenderPipeline<IndexedDraw>()) {
       return false;
     }
     CommandChunk *chk = cmd_queue.CurrentChunk();
@@ -1670,8 +2113,14 @@ public:
       }
     }
     dirty_state.clrAll();
-    return UploadShaderStageResourceBinding<ShaderType::Vertex>() &&
-           UploadShaderStageResourceBinding<ShaderType::Pixel>();
+    if (cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady) {
+      return UploadShaderStageResourceBinding<ShaderType::Vertex, true>() &&
+             UploadShaderStageResourceBinding<ShaderType::Pixel, true>() &&
+             UploadShaderStageResourceBinding<ShaderType::Hull, true>() &&
+             UploadShaderStageResourceBinding<ShaderType::Domain, true>();
+    }
+    return UploadShaderStageResourceBinding<ShaderType::Vertex, false>() &&
+           UploadShaderStageResourceBinding<ShaderType::Pixel, false>();
   }
 
   /**
@@ -1697,19 +2146,21 @@ public:
     Com<IMTLCompiledComputePipeline> pipeline;
     device->CreateComputePipeline(shader.ptr(), &pipeline);
 
+    const MTL_SHADER_REFLECTION *reflection =
+        state_.ShaderStages[(UINT)ShaderType::Compute].Shader->GetReflection();
+
     CommandChunk *chk = cmd_queue.CurrentChunk();
-    chk->emit(
-        [pso = std::move(pipeline),
-         tg_size = MTL::Size::Make(shader_data.Reflection->ThreadgroupSize[0],
-                                   shader_data.Reflection->ThreadgroupSize[1],
-                                   shader_data.Reflection->ThreadgroupSize[2])](
-            CommandChunk::context &ctx) {
-          MTL_COMPILED_COMPUTE_PIPELINE ComputePipeline;
-          pso->GetPipeline(&ComputePipeline); // may block
-          ctx.compute_encoder->setComputePipelineState(
-              ComputePipeline.PipelineState);
-          ctx.cs_threadgroup_size = tg_size;
-        });
+    chk->emit([pso = std::move(pipeline),
+               tg_size = MTL::Size::Make(reflection->ThreadgroupSize[0],
+                                         reflection->ThreadgroupSize[1],
+                                         reflection->ThreadgroupSize[2])](
+                  CommandChunk::context &ctx) {
+      MTL_COMPILED_COMPUTE_PIPELINE ComputePipeline;
+      pso->GetPipeline(&ComputePipeline); // may block
+      ctx.compute_encoder->setComputePipelineState(
+          ComputePipeline.PipelineState);
+      ctx.cs_threadgroup_size = tg_size;
+    });
 
     cmdbuf_state = CommandBufferState::ComputePipelineReady;
     return true;
@@ -1719,11 +2170,12 @@ public:
     if (!FinalizeCurrentComputePipeline()) {
       return false;
     }
-    UploadShaderStageResourceBinding<ShaderType::Compute>();
+    UploadShaderStageResourceBinding<ShaderType::Compute, false>();
     return true;
   }
 
-  template <ShaderType stage> bool UploadShaderStageResourceBinding() {
+  template <ShaderType stage, bool Tessellation>
+  bool UploadShaderStageResourceBinding() {
     auto &ShaderStage = state_.ShaderStages[(UINT)stage];
     if (!ShaderStage.Shader) {
       return true;
@@ -1732,8 +2184,8 @@ public:
                               ? state_.ComputeStageUAV.UAVs
                               : state_.OutputMerger.UAVs;
 
-    MTL_SHADER_REFLECTION *reflection;
-    ShaderStage.Shader->GetReflection(&reflection);
+    const MTL_SHADER_REFLECTION *reflection =
+        ShaderStage.Shader->GetReflection();
 
     bool dirty_cbuffer = ShaderStage.ConstantBuffers.any_dirty_masked(
         reflection->ConstantBufferSlotMask);
@@ -1759,6 +2211,8 @@ public:
             switch (stage) {
             case ShaderType::Vertex:
             case ShaderType::Pixel:
+            case ShaderType::Hull:
+            case ShaderType::Domain:
               ctx.render_encoder->useResource(
                   res.resource(&ctx), GetUsageFromResidencyMask(residencyMask),
                   GetStagesFromResidencyMask(residencyMask));
@@ -1768,8 +2222,6 @@ public:
                   res.resource(&ctx), GetUsageFromResidencyMask(residencyMask));
               break;
             case ShaderType::Geometry:
-            case ShaderType::Hull:
-            case ShaderType::Domain:
               D3D11_ASSERT(0 && "Not implemented");
               break;
             }
@@ -1797,9 +2249,9 @@ public:
           write_to_it[arg.StructurePtrOffset] =
               argbuf.buffer() + (cbuf.FirstConstant << 4);
           ShaderStage.ConstantBuffers.clear_dirty(slot);
-          pTracker->CheckResidency(encoderId,
-                                   GetResidencyMask(stage, true, false),
-                                   &newResidencyMask);
+          pTracker->CheckResidency(
+              encoderId, GetResidencyMask<Tessellation>(stage, true, false),
+              &newResidencyMask);
           if (newResidencyMask) {
             useResource(cbuf.Buffer->UseBindable(currentChunkId),
                         newResidencyMask);
@@ -1814,11 +2266,19 @@ public:
       /* kConstantBufferTableBinding = 29 */
       chk->emit([offset](CommandChunk::context &ctx) {
         if constexpr (stage == ShaderType::Vertex) {
-          ctx.render_encoder->setVertexBufferOffset(offset, 29);
+          if constexpr (Tessellation) {
+            ctx.render_encoder->setObjectBufferOffset(offset, 29);
+          } else {
+            ctx.render_encoder->setVertexBufferOffset(offset, 29);
+          }
         } else if constexpr (stage == ShaderType::Pixel) {
           ctx.render_encoder->setFragmentBufferOffset(offset, 29);
         } else if constexpr (stage == ShaderType::Compute) {
           ctx.compute_encoder->setBufferOffset(offset, 29);
+        } else if constexpr (stage == ShaderType::Hull) {
+          ctx.render_encoder->setMeshBufferOffset(offset, 29);
+        } else if constexpr (stage == ShaderType::Domain) {
+          ctx.render_encoder->setVertexBufferOffset(offset, 29);
         } else {
           D3D11_ASSERT(0 && "Not implemented");
         }
@@ -1828,7 +2288,7 @@ public:
     if (BindingCount && (dirty_sampler || dirty_srv || dirty_uav)) {
 
       /* FIXME: we are over-allocating */
-      auto [heap, offset] = chk->allocate_gpu_heap(BindingCount << 4, 16);
+      auto [heap, offset] = chk->allocate_gpu_heap(BindingCount * 8 * 3, 16);
       uint64_t *write_to_it = chk->gpu_argument_heap_contents + (offset >> 3);
 
       for (unsigned i = 0; i < BindingCount; i++) {
@@ -1874,17 +2334,20 @@ public:
           }
           if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
             if (arg_data.requiresContext()) {
-              D3D11_ASSERT(0 && "todo");
+              chk->emit([=, ref = srv.SRV](CommandChunk::context &ctx) {
+                write_to_it[arg.StructurePtrOffset] = arg_data.resource(&ctx);
+              });
             } else {
               write_to_it[arg.StructurePtrOffset] = arg_data.texture();
             }
           }
           if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
+            D3D11_ASSERT(0 && "srv can not have counter associated");
           }
           ShaderStage.SRVs.clear_dirty(slot);
-          pTracker->CheckResidency(encoderId,
-                                   GetResidencyMask(stage, true, false),
-                                   &newResidencyMask);
+          pTracker->CheckResidency(
+              encoderId, GetResidencyMask<Tessellation>(stage, true, false),
+              &newResidencyMask);
           if (newResidencyMask) {
             useResource(srv.SRV->UseBindable(currentChunkId), newResidencyMask);
           }
@@ -1926,16 +2389,44 @@ public:
             }
           }
           if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
-            ERR("todo: implement uav counter binding");
-            return false;
+            auto counter_handle = arg_data.counter_handle();
+            if (counter_handle != DXMT_NO_COUNTER) {
+              auto counter = cmd_queue.counter_pool.GetCounter(counter_handle);
+              chk->emit([counter](CommandChunk::context &ctx) {
+                switch (stage) {
+                case ShaderType::Vertex:
+                case ShaderType::Pixel:
+                case ShaderType::Hull:
+                case ShaderType::Domain:
+                  ctx.render_encoder->useResource(counter.Buffer,
+                                                  MTL::ResourceUsageRead |
+                                                      MTL::ResourceUsageWrite);
+                  break;
+                case ShaderType::Compute:
+                  ctx.compute_encoder->useResource(counter.Buffer,
+                                                   MTL::ResourceUsageRead |
+                                                       MTL::ResourceUsageWrite);
+                  break;
+                case ShaderType::Geometry:
+                  D3D11_ASSERT(0 && "Not implemented");
+                  break;
+                }
+              });
+              write_to_it[arg.StructurePtrOffset + 2] =
+                  counter.Buffer->gpuAddress() + counter.Offset;
+            } else {
+              ERR("use uninitialized counter!");
+              write_to_it[arg.StructurePtrOffset + 2] = 0;
+            };
           }
           UAVBindingSet.clear_dirty(slot);
-          pTracker->CheckResidency(
-              encoderId,
-              GetResidencyMask(stage,
-                               // FIXME: don't use literal constant...
-                               (arg.Flags >> 10) & 1, (arg.Flags >> 10) & 2),
-              &newResidencyMask);
+          pTracker->CheckResidency(encoderId,
+                                   GetResidencyMask<Tessellation>(
+                                       stage,
+                                       // FIXME: don't use literal constant...
+                                       (arg.Flags >> 10) & 1,
+                                       (arg.Flags >> 10) & 2),
+                                   &newResidencyMask);
           if (newResidencyMask) {
             useResource(uav.View->UseBindable(currentChunkId),
                         newResidencyMask);
@@ -1948,11 +2439,19 @@ public:
       /* kArgumentBufferBinding = 30 */
       chk->emit([offset](CommandChunk::context &ctx) {
         if constexpr (stage == ShaderType::Vertex) {
-          ctx.render_encoder->setVertexBufferOffset(offset, 30);
+          if constexpr (Tessellation) {
+            ctx.render_encoder->setObjectBufferOffset(offset, 30);
+          } else {
+            ctx.render_encoder->setVertexBufferOffset(offset, 30);
+          }
         } else if constexpr (stage == ShaderType::Pixel) {
           ctx.render_encoder->setFragmentBufferOffset(offset, 30);
         } else if constexpr (stage == ShaderType::Compute) {
           ctx.compute_encoder->setBufferOffset(offset, 30);
+        } else if constexpr (stage == ShaderType::Hull) {
+          ctx.render_encoder->setMeshBufferOffset(offset, 30);
+        } else if constexpr (stage == ShaderType::Domain) {
+          ctx.render_encoder->setVertexBufferOffset(offset, 30);
         } else {
           D3D11_ASSERT(0 && "Not implemented");
         }
@@ -1963,7 +2462,9 @@ public:
 
   template <typename Fn> void EmitRenderCommand(Fn &&fn) {
     D3D11_ASSERT(cmdbuf_state == CommandBufferState::RenderEncoderActive ||
-                 cmdbuf_state == CommandBufferState::RenderPipelineReady);
+                 cmdbuf_state == CommandBufferState::RenderPipelineReady ||
+                 cmdbuf_state ==
+                     CommandBufferState::TessellationRenderPipelineReady);
     CommandChunk *chk = cmd_queue.CurrentChunk();
     chk->emit([fn = std::forward<Fn>(fn)](CommandChunk::context &ctx) {
       std::invoke(fn, ctx.render_encoder.ptr());
@@ -1972,7 +2473,9 @@ public:
 
   template <typename Fn> void EmitRenderCommandChk(Fn &&fn) {
     D3D11_ASSERT(cmdbuf_state == CommandBufferState::RenderEncoderActive ||
-                 cmdbuf_state == CommandBufferState::RenderPipelineReady);
+                 cmdbuf_state == CommandBufferState::RenderPipelineReady ||
+                 cmdbuf_state ==
+                     CommandBufferState::TessellationRenderPipelineReady);
     CommandChunk *chk = cmd_queue.CurrentChunk();
     chk->emit([fn = std::forward<Fn>(fn)](CommandChunk::context &ctx) {
       std::invoke(fn, ctx);
@@ -2006,11 +2509,13 @@ public:
     }
   };
 
-  template <bool Force = false, typename Fn> void EmitBlitCommand(Fn &&fn) {
+  template <bool Force = false, typename Fn>
+  void EmitBlitCommand(Fn &&fn, CommandBufferState BlitKind =
+                                    CommandBufferState::BlitEncoderActive) {
     if (Force) {
-      SwitchToBlitEncoder();
+      SwitchToBlitEncoder(BlitKind);
     }
-    if (cmdbuf_state == CommandBufferState::BlitEncoderActive) {
+    if (cmdbuf_state == BlitKind) {
       CommandChunk *chk = cmd_queue.CurrentChunk();
       chk->emit([fn = std::forward<Fn>(fn)](CommandChunk::context &ctx) {
         fn(ctx.blit_encoder.ptr(), ctx);
@@ -2023,28 +2528,70 @@ public:
   - index buffer and input topology are provided in draw commands
   */
   void UpdateVertexBuffer() {
-    if (!state_.InputAssembler.InputLayout) {
+    if (!state_.InputAssembler.InputLayout)
       return;
-    }
+
+    uint32_t slot_mask = state_.InputAssembler.InputLayout->GetInputSlotMask();
+    if (slot_mask == 0) // effectively empty input layout
+      return;
+
     auto &VertexBuffers = state_.InputAssembler.VertexBuffers;
-    if (!VertexBuffers.any_dirty_masked(
-            (uint64_t)state_.InputAssembler.InputLayout->GetInputSlotMask())) {
+    if (!VertexBuffers.any_dirty_masked((uint64_t)slot_mask))
       return;
-    }
-    for (unsigned index = 0; index < 16; index++) {
-      if (!VertexBuffers.test_bound(index) ||
-          !VertexBuffers.test_dirty(index)) {
+
+    struct VERTEX_BUFFER_ENTRY {
+      uint64_t buffer_handle;
+      uint32_t stride;
+      uint32_t length;
+    };
+
+    uint32_t VERTEX_BUFFER_SLOTS = 32 - __builtin_clz(slot_mask);
+
+    CommandChunk *chk = cmd_queue.CurrentChunk();
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    auto [heap, offset] = chk->allocate_gpu_heap(16 * VERTEX_BUFFER_SLOTS, 16);
+    VERTEX_BUFFER_ENTRY *entries =
+        (VERTEX_BUFFER_ENTRY *)(((char *)heap->contents()) + offset);
+    for (unsigned index = 0; index < VERTEX_BUFFER_SLOTS; index++) {
+      if (!VertexBuffers.test_bound(index)) {
+        entries[index].buffer_handle = 0;
+        entries[index].stride = 0;
+        entries[index].length = 0;
         continue;
       }
       auto &state = VertexBuffers[index];
-      // a ref is necessary (in case buffer destroyed before encoding)
-      EmitRenderCommand([buffer = state.BufferRaw, ref = Com(state.RawPointer),
-                         offset = state.Offset, stride = state.Stride,
-                         index](MTL::RenderCommandEncoder *encoder) {
-        encoder->setVertexBuffer(buffer, offset, stride, index);
-      });
-      VertexBuffers.clear_dirty(index);
+      MTL_BINDABLE_RESIDENCY_MASK newResidencyMask = MTL_RESIDENCY_NULL;
+      SIMPLE_RESIDENCY_TRACKER *pTracker;
+      auto handle = state.Buffer->GetArgumentData(&pTracker);
+      entries[index].buffer_handle = handle.buffer() + state.Offset;
+      entries[index].stride = state.Stride;
+      entries[index].length =
+          handle.width() > state.Offset ? handle.width() - state.Offset : 0;
+      pTracker->CheckResidency(
+          currentChunkId,
+          cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady
+              ? GetResidencyMask<true>(ShaderType::Vertex, true, false)
+              : GetResidencyMask<false>(ShaderType::Vertex, true, false),
+          &newResidencyMask);
+      if (newResidencyMask) {
+        chk->emit([res = state.Buffer->UseBindable(currentChunkId),
+                   newResidencyMask](CommandChunk::context &ctx) {
+          ctx.render_encoder->useResource(
+              res.buffer(), GetUsageFromResidencyMask(newResidencyMask),
+              GetStagesFromResidencyMask(newResidencyMask));
+        });
+      }
     };
+    if (cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady) {
+      chk->emit([offset](CommandChunk::context &ctx) {
+        ctx.render_encoder->setObjectBufferOffset(offset, 16);
+      });
+    }
+    if (cmdbuf_state == CommandBufferState::RenderPipelineReady) {
+      chk->emit([offset](CommandChunk::context &ctx) {
+        ctx.render_encoder->setVertexBufferOffset(offset, 16);
+      });
+    }
   }
 
   void UpdateSOTargets() {
@@ -2104,7 +2651,8 @@ private:
 public:
   uint64_t NextOcclusionQuerySeq() {
     if (cmdbuf_state == CommandBufferState::RenderEncoderActive ||
-        cmdbuf_state == CommandBufferState::RenderPipelineReady) {
+        cmdbuf_state == CommandBufferState::RenderPipelineReady ||
+        cmdbuf_state == CommandBufferState::TessellationRenderPipelineReady) {
       uint64_t bump_offset = (++occlusion_query_seq) % kOcclusionSampleCount;
       CommandChunk *chk = cmd_queue.CurrentChunk();
       chk->emit([bump_offset](CommandChunk::context &ctx) {
@@ -2117,24 +2665,6 @@ public:
   };
 
 #pragma endregion
-
-  /**
-  Valid transition:
-  * -> Idle
-  Idle -> RenderEncoderActive
-  Idle -> ComputeEncoderActive
-  Idle -> BlitEncoderActive
-  RenderEncoderActive <-> RenderPipelineReady
-  ComputeEncoderActive <-> CoputePipelineReady
-  */
-  enum class CommandBufferState {
-    Idle,
-    RenderEncoderActive,
-    RenderPipelineReady,
-    ComputeEncoderActive,
-    ComputePipelineReady,
-    BlitEncoderActive
-  };
 
 #pragma region Default State
 

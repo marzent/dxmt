@@ -28,25 +28,26 @@ public:
   };
 };
 
-auto to_metal_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
+std::pair<MTL::PrimitiveType, uint32_t>
+to_metal_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
 
   switch (topo) {
   case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
-    return MTL::PrimitiveTypePoint;
+    return {MTL::PrimitiveTypePoint, 0};
   case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
-    return MTL::PrimitiveTypeLine;
+    return {MTL::PrimitiveTypeLine, 0};
   case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
-    return MTL::PrimitiveTypeLineStrip;
+    return {MTL::PrimitiveTypeLineStrip, 0};
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST:
-    return MTL::PrimitiveTypeTriangle;
+    return {MTL::PrimitiveTypeTriangle, 0};
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:
-    return MTL::PrimitiveTypeTriangleStrip;
+    return {MTL::PrimitiveTypeTriangleStrip, 0};
   case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
   case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ:
   case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
     // FIXME
-    return MTL::PrimitiveTypePoint;
+    return {MTL::PrimitiveTypePoint, 0};
   case D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST:
   case D3D_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST:
   case D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST:
@@ -80,11 +81,19 @@ auto to_metal_topology(D3D11_PRIMITIVE_TOPOLOGY topo) {
   case D3D_PRIMITIVE_TOPOLOGY_31_CONTROL_POINT_PATCHLIST:
   case D3D_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST:
     // FIXME
-    return MTL::PrimitiveTypePoint;
+    return {MTL::PrimitiveTypePoint, topo - 32};
   case D3D_PRIMITIVE_TOPOLOGY_UNDEFINED:
     throw MTLD3DError("Invalid topology");
   }
 }
+
+struct DXMT_DRAW_ARGUMENTS {
+  uint32_t IndexCount;
+  uint32_t StartIndex;
+  uint32_t InstanceCount;
+  uint32_t StartInstance;
+  uint32_t BaseVertex;
+};
 
 class MTLD3D11DeviceContext : public MTLD3D11DeviceContextBase {
 public:
@@ -147,6 +156,7 @@ public:
       break;
     case D3D11_QUERY_OCCLUSION: {
       ((IMTLD3DOcclusionQuery *)pAsync)->End(ctx.NextOcclusionQuerySeq());
+      ctx.promote_flush = true;
       break;
     }
     case D3D11_QUERY_TIMESTAMP:
@@ -180,7 +190,8 @@ public:
     case D3D11_QUERY_EVENT: {
       BOOL null_data;
       BOOL *data_ptr = pData ? (BOOL *)pData : &null_data;
-      return ((IMTLD3DEventQuery *)pAsync)->GetData(data_ptr, cmd_queue.CoherentSeqId());
+      return ((IMTLD3DEventQuery *)pAsync)
+          ->GetData(data_ptr, cmd_queue.CoherentSeqId());
     }
     case D3D11_QUERY_OCCLUSION: {
       uint64_t null_data;
@@ -426,10 +437,6 @@ public:
     D3D11_TEXTURE2D_DESC desc;
     uint32_t width, height;
     ((ID3D11Texture2D *)pSrcResource)->GetDesc(&desc);
-    if (desc.SampleDesc.Count < 2) {
-      ERR("ResolveSubresource: Source is not multisampled ", desc.SampleDesc.Count);
-      return;
-    }
     if (desc.ArraySize <= DstSubresource) {
       return;
     }
@@ -457,15 +464,17 @@ public:
 
   void CopyResource(ID3D11Resource *pDstResource,
                     ID3D11Resource *pSrcResource) override {
-    D3D11_RESOURCE_DIMENSION dst_dim, src_dim;
-    pDstResource->GetType(&dst_dim);
-    pSrcResource->GetType(&src_dim);
-    if (dst_dim != src_dim)
-      return;
-    switch (dst_dim) {
+    Com<IMTLDXGIAdatper> adapter;
+    this->m_parent->GetAdapter(&adapter);
+    BlitObject Dst(adapter.ptr(), pDstResource);
+    BlitObject Src(adapter.ptr(), pSrcResource);
+
+    switch (Dst.Dimension) {
     case D3D11_RESOURCE_DIMENSION_UNKNOWN:
       break;
     case D3D11_RESOURCE_DIMENSION_BUFFER: {
+      if (Src.Dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return;
       ctx.CopyBuffer((ID3D11Buffer *)pDstResource, 0, 0, 0, 0,
                      (ID3D11Buffer *)pSrcResource, 0, nullptr);
       break;
@@ -478,9 +487,8 @@ public:
       D3D11_TEXTURE2D_DESC desc;
       ((ID3D11Texture2D *)pSrcResource)->GetDesc(&desc);
       for (auto sub : EnumerateSubresources(desc)) {
-        ctx.CopyTexture2D((ID3D11Texture2D *)pDstResource, sub.SubresourceId, 0,
-                          0, 0, (ID3D11Texture2D *)pSrcResource,
-                          sub.SubresourceId, nullptr);
+        ctx.CopyTexture(TextureCopyCommand(Dst, sub.SubresourceId, 0, 0, 0, Src,
+                                           sub.SubresourceId, nullptr));
       }
       break;
     }
@@ -493,7 +501,22 @@ public:
 
   void CopyStructureCount(ID3D11Buffer *pDstBuffer, UINT DstAlignedByteOffset,
                           ID3D11UnorderedAccessView *pSrcView) override {
-    IMPLEMENT_ME
+    if (auto dst_bind = com_cast<IMTLBindable>(pDstBuffer)) {
+      if (auto uav = com_cast<IMTLD3D11UnorderedAccessView>(pSrcView)) {
+        auto counter_handle = uav->SwapCounter(DXMT_NO_COUNTER);
+        if (counter_handle == DXMT_NO_COUNTER) {
+          return;
+        }
+        auto counter = cmd_queue.counter_pool.GetCounter(counter_handle);
+        ctx.EmitBlitCommand<true>(
+            [counter, DstAlignedByteOffset,
+             dst = dst_bind->UseBindable(cmd_queue.CurrentSeqId())](
+                MTL::BlitCommandEncoder *enc, auto &ctx) {
+              enc->copyFromBuffer(counter.Buffer, counter.Offset, dst.buffer(),
+                                  DstAlignedByteOffset, 4);
+            });
+      }
+    }
   }
 
   void CopySubresourceRegion(ID3D11Resource *pDstResource, UINT DstSubresource,
@@ -509,37 +532,31 @@ public:
                               ID3D11Resource *pSrcResource, UINT SrcSubresource,
                               const D3D11_BOX *pSrcBox,
                               UINT CopyFlags) override {
-    D3D11_RESOURCE_DIMENSION dst_dim, src_dim;
-    pDstResource->GetType(&dst_dim);
-    pSrcResource->GetType(&src_dim);
-    if (dst_dim != src_dim)
+    if (!pDstResource)
       return;
-    switch (dst_dim) {
-    case D3D11_RESOURCE_DIMENSION_UNKNOWN: {
+    if (!pSrcResource)
+      return;
+
+    Com<IMTLDXGIAdatper> adapter;
+    this->m_parent->GetAdapter(&adapter);
+    BlitObject Dst(adapter.ptr(), pDstResource);
+    BlitObject Src(adapter.ptr(), pSrcResource);
+
+    switch (Dst.Dimension) {
+    case D3D11_RESOURCE_DIMENSION_UNKNOWN:
       break;
-    }
     case D3D11_RESOURCE_DIMENSION_BUFFER: {
+      if (Src.Dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return;
       ctx.CopyBuffer((ID3D11Buffer *)pDstResource, DstSubresource, DstX, DstY,
                      DstZ, (ID3D11Buffer *)pSrcResource, SrcSubresource,
                      pSrcBox);
       break;
     }
-    case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
-      ctx.CopyTexture1D((ID3D11Texture1D *)pDstResource, DstSubresource, DstX,
-                        DstY, DstZ, (ID3D11Texture1D *)pSrcResource,
-                        SrcSubresource, pSrcBox);
+    default:
+      ctx.CopyTexture(TextureCopyCommand(Dst, DstSubresource, DstX, DstY, DstZ,
+                                         Src, SrcSubresource, pSrcBox));
       break;
-    }
-    case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
-      ctx.CopyTexture2D((ID3D11Texture2D *)pDstResource, DstSubresource, DstX,
-                        DstY, DstZ, (ID3D11Texture2D *)pSrcResource,
-                        SrcSubresource, pSrcBox);
-      break;
-    }
-    case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
-      D3D11_ASSERT(0 && "TODO: CopySubresourceRegion1 for tex3d");
-      break;
-    }
     }
   }
 
@@ -556,20 +573,20 @@ public:
                           UINT CopyFlags) override {
     if (!pDstResource)
       return;
-    if (pDstBox != NULL) {
-      if (pDstBox->right <= pDstBox->left || pDstBox->bottom <= pDstBox->top ||
-          pDstBox->back <= pDstBox->front) {
-        return;
-      }
-    }
-    D3D11_RESOURCE_DIMENSION dim;
-    pDstResource->GetType(&dim);
-    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+
+    Com<IMTLDXGIAdatper> adapter;
+    this->m_parent->GetAdapter(&adapter);
+    BlitObject Dst(adapter.ptr(), pDstResource);
+
+    if (Dst.Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
       D3D11_BUFFER_DESC desc;
       ((ID3D11Buffer *)pDstResource)->GetDesc(&desc);
       uint32_t copy_offset = 0;
       uint32_t copy_len = desc.ByteWidth;
       if (pDstBox) {
+        if (pDstBox->right <= pDstBox->left) {
+          return;
+        }
         copy_offset = pDstBox->left;
         copy_len = pDstBox->right - copy_offset;
       }
@@ -592,7 +609,8 @@ public:
              copy_len](MTL::BlitCommandEncoder *enc, auto &ctx) {
               enc->copyFromBuffer(staging_buffer, offset, dst.buffer(),
                                   copy_offset, copy_len);
-            });
+            },
+            ContextInternal::CommandBufferState::UpdateBlitEncoderActive);
       } else if (auto dynamic = com_cast<IMTLDynamicBindable>(pDstResource)) {
         D3D11_ASSERT(CopyFlags && "otherwise resource cannot be dynamic");
         D3D11_ASSERT(0 && "UpdateSubresource1: TODO");
@@ -601,119 +619,9 @@ public:
       }
       return;
     }
-    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
-      D3D11_TEXTURE2D_DESC desc;
-      ((ID3D11Texture2D *)pDstResource)->GetDesc(&desc);
-      if (DstSubresource >= desc.MipLevels * desc.ArraySize) {
-        ERR("out of bound texture write");
-        return;
-      }
-      auto slice = DstSubresource / desc.MipLevels;
-      auto level = DstSubresource % desc.MipLevels;
-      uint32_t copy_rows = std::max(desc.Height >> level, 1u);
-      uint32_t copy_columns = std::max(desc.Width >> level, 1u);
-      uint32_t origin_x = 0;
-      uint32_t origin_y = 0;
-      if (pDstBox) {
-        copy_rows = pDstBox->bottom - pDstBox->top;
-        copy_columns = pDstBox->right - pDstBox->left;
-        origin_x = pDstBox->left;
-        origin_y = pDstBox->top;
-      }
-      if (auto bindable = com_cast<IMTLBindable>(pDstResource)) {
-        while (!bindable->GetContentionState(cmd_queue.CoherentSeqId())) {
-          auto dst = bindable->UseBindable(cmd_queue.CurrentSeqId());
-          auto texture = dst.texture();
-          if (!texture)
-            break;
-          texture->replaceRegion(
-              MTL::Region::Make2D(origin_x, origin_y, copy_columns, copy_rows),
-              level, slice, pSrcData, SrcRowPitch, 0);
-          return;
-        }
-        auto copy_len = copy_rows * SrcRowPitch;
-        auto [ptr, staging_buffer, offset] =
-            cmd_queue.AllocateStagingBuffer(copy_len, 16);
-        memcpy(ptr, pSrcData, copy_len);
-        ctx.EmitBlitCommand<true>(
-            [staging_buffer, offset,
-             dst = bindable->UseBindable(cmd_queue.CurrentSeqId()), SrcRowPitch,
-             copy_rows, copy_columns, origin_x, origin_y, slice,
-             level](MTL::BlitCommandEncoder *enc, auto &ctx) {
-              enc->copyFromBuffer(staging_buffer, offset, SrcRowPitch, 0,
-                                  MTL::Size::Make(copy_columns, copy_rows, 1),
-                                  dst.texture(&ctx), slice, level,
-                                  MTL::Origin::Make(origin_x, origin_y, 0));
-            });
-      } else if (auto dynamic = com_cast<IMTLDynamicBindable>(pDstResource)) {
-        D3D11_ASSERT(CopyFlags && "otherwise resource cannot be dynamic");
-        D3D11_ASSERT(0 && "UpdateSubresource1: TODO");
-      } else {
-        // staging: ...
-        D3D11_ASSERT(0 && "UpdateSubresource1: TODO: texture2d");
-      }
-      return;
-    }
-    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE3D) {
-      D3D11_TEXTURE3D_DESC desc;
-      ((ID3D11Texture3D *)pDstResource)->GetDesc(&desc);
-      if (DstSubresource >= desc.MipLevels) {
-        ERR("out of bound texture write");
-        return;
-      }
-      auto level = DstSubresource % desc.MipLevels;
-      uint32_t copy_rows = std::max(desc.Height >> level, 1u);
-      uint32_t copy_columns = std::max(desc.Width >> level, 1u);
-      uint32_t copy_w = std::max(desc.Depth >> level, 1u);
-      uint32_t origin_x = 0;
-      uint32_t origin_y = 0;
-      uint32_t origin_z = 0;
-      if (pDstBox) {
-        copy_rows = pDstBox->bottom - pDstBox->top;
-        copy_columns = pDstBox->right - pDstBox->left;
-        copy_w = pDstBox->back - pDstBox->front;
-        origin_x = pDstBox->left;
-        origin_y = pDstBox->top;
-        origin_z = pDstBox->front;
-      }
-      if (auto bindable = com_cast<IMTLBindable>(pDstResource)) {
-        while (!bindable->GetContentionState(cmd_queue.CoherentSeqId())) {
-          auto dst = bindable->UseBindable(cmd_queue.CurrentSeqId());
-          auto texture = dst.texture();
-          if (!texture)
-            break;
-          texture->replaceRegion(
-              MTL::Region::Make3D(origin_x, origin_y, origin_z, copy_columns,
-                                  copy_rows, copy_w),
-              level, 0, pSrcData, SrcRowPitch, SrcDepthPitch);
-          return;
-        }
-        auto copy_len = copy_w * SrcDepthPitch;
-        auto [ptr, staging_buffer, offset] =
-            cmd_queue.AllocateStagingBuffer(copy_len, 16);
-        memcpy(ptr, pSrcData, copy_len);
-        ctx.EmitBlitCommand<true>(
-            [staging_buffer, offset,
-             dst = bindable->UseBindable(cmd_queue.CurrentSeqId()), SrcRowPitch,
-             SrcDepthPitch, copy_rows, copy_columns, copy_w, origin_x, origin_y,
-             origin_z, level](MTL::BlitCommandEncoder *enc, auto &ctx) {
-              enc->copyFromBuffer(
-                  staging_buffer, offset, SrcRowPitch, SrcDepthPitch,
-                  MTL::Size::Make(copy_columns, copy_rows, copy_w),
-                  dst.texture(&ctx), 0, level,
-                  MTL::Origin::Make(origin_x, origin_y, origin_z));
-            });
-      } else if (auto dynamic = com_cast<IMTLDynamicBindable>(pDstResource)) {
-        D3D11_ASSERT(CopyFlags && "otherwise resource cannot be dynamic");
-        D3D11_ASSERT(0 && "UpdateSubresource1: TODO");
-      } else {
-        // staging: ...
-        D3D11_ASSERT(0 && "UpdateSubresource1: TODO: texture2d");
-      }
-      return;
-    }
 
-    IMPLEMENT_ME
+    ctx.UpdateTexture(TextureUpdateCommand(Dst, DstSubresource, pDstBox),
+                      pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }
 
   void DiscardResource(ID3D11Resource *pResource) override {
@@ -739,10 +647,14 @@ public:
 #pragma region DrawCall
 
   void Draw(UINT VertexCount, UINT StartVertexLocation) override {
-    if (!ctx.PreDraw())
+    if (!ctx.PreDraw<false>())
       return;
-    MTL::PrimitiveType Primitive =
+    auto [Primitive, ControlPointCount] =
         to_metal_topology(state_.InputAssembler.Topology);
+    if (ControlPointCount) {
+      return TessellationDraw(ControlPointCount, VertexCount, 1,
+                              StartVertexLocation, 0);
+    }
     // TODO: skip invalid topology
     ctx.EmitRenderCommand([Primitive, StartVertexLocation,
                            VertexCount](MTL::RenderCommandEncoder *encoder) {
@@ -752,10 +664,15 @@ public:
 
   void DrawIndexed(UINT IndexCount, UINT StartIndexLocation,
                    INT BaseVertexLocation) override {
-    if (!ctx.PreDraw())
+    if (!ctx.PreDraw<true>())
       return;
-    MTL::PrimitiveType Primitive =
+    auto [Primitive, ControlPointCount] =
         to_metal_topology(state_.InputAssembler.Topology);
+    if (ControlPointCount) {
+      return TessellationDrawIndexed(ControlPointCount, IndexCount,
+                                     StartIndexLocation, BaseVertexLocation, 1,
+                                     0);
+    };
     auto IndexType =
         state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
             ? MTL::IndexTypeUInt32
@@ -779,10 +696,15 @@ public:
   void DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount,
                      UINT StartVertexLocation,
                      UINT StartInstanceLocation) override {
-    if (!ctx.PreDraw())
+    if (!ctx.PreDraw<false>())
       return;
-    MTL::PrimitiveType Primitive =
+    auto [Primitive, ControlPointCount] =
         to_metal_topology(state_.InputAssembler.Topology);
+    if (ControlPointCount) {
+      return TessellationDraw(ControlPointCount, VertexCountPerInstance,
+                              InstanceCount, StartVertexLocation,
+                              StartInstanceLocation);
+    }
     // TODO: skip invalid topology
     ctx.EmitRenderCommand(
         [Primitive, StartVertexLocation, VertexCountPerInstance, InstanceCount,
@@ -796,10 +718,16 @@ public:
   void DrawIndexedInstanced(UINT IndexCountPerInstance, UINT InstanceCount,
                             UINT StartIndexLocation, INT BaseVertexLocation,
                             UINT StartInstanceLocation) override {
-    if (!ctx.PreDraw())
+    if (!ctx.PreDraw<true>())
       return;
-    MTL::PrimitiveType Primitive =
+    auto [Primitive, ControlPointCount] =
         to_metal_topology(state_.InputAssembler.Topology);
+    if (ControlPointCount) {
+      return TessellationDrawIndexed(ControlPointCount, IndexCountPerInstance,
+                                     StartIndexLocation, BaseVertexLocation,
+                                     InstanceCount, StartInstanceLocation);
+      return;
+    }
     // TODO: skip invalid topology
     auto IndexType =
         state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
@@ -823,14 +751,152 @@ public:
         });
   }
 
+  void TessellationDraw(UINT NumControlPoint, UINT VertexCountPerInstance,
+                        UINT InstanceCount, UINT StartVertexLocation,
+                        UINT StartInstanceLocation) {
+    assert(NumControlPoint);
+    // allocate draw arguments
+    CommandChunk *chk = cmd_queue.CurrentChunk();
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    auto [heap, offset] = chk->allocate_gpu_heap(4 * 5, 4);
+    auto PatchCountPerInstance = VertexCountPerInstance / NumControlPoint;
+    DXMT_DRAW_ARGUMENTS *draw_arugment =
+        (DXMT_DRAW_ARGUMENTS *)(((char *)heap->contents()) + offset);
+    draw_arugment->BaseVertex = StartVertexLocation;
+    draw_arugment->IndexCount = VertexCountPerInstance;
+    draw_arugment->StartIndex = 0;
+    draw_arugment->InstanceCount = InstanceCount;
+    draw_arugment->StartInstance = StartInstanceLocation;
+    ctx.EmitRenderCommandChk([=](CommandChunk::context &ctx) {
+      auto &encoder = ctx.render_encoder;
+      encoder->setObjectBuffer(heap, offset, 21);
+      assert(ctx.tess_num_output_control_point_element);
+      auto PatchPerGroup = 32 / ctx.tess_threads_per_patch;
+      auto PatchPerMeshInstance =
+          (PatchCountPerInstance - 1) / PatchPerGroup + 1;
+      auto [_0, cp_buffer, cp_offset] = ctx.queue->AllocateTempBuffer(
+          currentChunkId,
+          ctx.tess_num_output_control_point_element * 16 *
+              VertexCountPerInstance * InstanceCount,
+          16);
+      auto [_1, pc_buffer, pc_offset] = ctx.queue->AllocateTempBuffer(
+          currentChunkId,
+          ctx.tess_num_output_patch_constant_scalar * 4 *
+              PatchCountPerInstance * InstanceCount,
+          4);
+      auto [_2, tess_factor_buffer, tess_factor_offset] =
+          ctx.queue->AllocateTempBuffer(
+              currentChunkId, 6 * 2 * PatchCountPerInstance * InstanceCount, 4);
+      encoder->setMeshBuffer(cp_buffer, cp_offset, 20);
+      encoder->setMeshBuffer(pc_buffer, pc_offset, 21);
+      encoder->setMeshBuffer(tess_factor_buffer, tess_factor_offset, 22);
+      encoder->setRenderPipelineState(ctx.tess_mesh_pso);
+
+      encoder->drawMeshThreadgroups(
+          MTL::Size(PatchPerMeshInstance, InstanceCount, 1),
+          MTL::Size(ctx.tess_threads_per_patch, 32 / ctx.tess_threads_per_patch,
+                    1),
+          MTL::Size(ctx.tess_threads_per_patch, 32 / ctx.tess_threads_per_patch,
+                    1));
+
+      encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageMesh,
+                             MTL::RenderStageVertex);
+
+      encoder->setRenderPipelineState(ctx.tess_raster_pso);
+      encoder->setVertexBuffer(cp_buffer, cp_offset, 20);
+      encoder->setVertexBuffer(pc_buffer, pc_offset, 21);
+      encoder->setVertexBuffer(tess_factor_buffer, tess_factor_offset, 22);
+      encoder->setTessellationFactorBuffer(tess_factor_buffer,
+                                           tess_factor_offset, 0);
+      encoder->drawPatches(0, 0,
+                           PatchCountPerInstance * InstanceCount, //
+                           nullptr, 0, 1, 0);
+    });
+  }
+
+  void TessellationDrawIndexed(UINT NumControlPoint, UINT IndexCountPerInstance,
+                               UINT StartIndexLocation, INT BaseVertexLocation,
+                               UINT InstanceCount, UINT BaseInstance) {
+    assert(NumControlPoint);
+    auto IndexBufferOffset =
+        state_.InputAssembler.IndexBufferOffset +
+        StartIndexLocation *
+            (state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
+                 ? 4
+                 : 2);
+    // allocate draw arguments
+    CommandChunk *chk = cmd_queue.CurrentChunk();
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    auto [heap, offset] = chk->allocate_gpu_heap(4 * 5, 4);
+    auto PatchCountPerInstance = IndexCountPerInstance / NumControlPoint;
+    DXMT_DRAW_ARGUMENTS *draw_arugment =
+        (DXMT_DRAW_ARGUMENTS *)(((char *)heap->contents()) + offset);
+    draw_arugment->BaseVertex = BaseVertexLocation;
+    draw_arugment->IndexCount = IndexCountPerInstance;
+    draw_arugment->StartIndex = 0; // already provided offset
+    draw_arugment->InstanceCount = InstanceCount;
+    draw_arugment->StartInstance = BaseInstance;
+    ctx.EmitRenderCommandChk([=](CommandChunk::context &ctx) {
+      D3D11_ASSERT(ctx.current_index_buffer_ref);
+      auto &encoder = ctx.render_encoder;
+      encoder->setObjectBuffer(ctx.current_index_buffer_ref, IndexBufferOffset,
+                               20);
+      encoder->setObjectBuffer(heap, offset, 21);
+      assert(ctx.tess_num_output_control_point_element);
+      auto PatchPerGroup = 32 / ctx.tess_threads_per_patch;
+      auto PatchPerMeshInstance =
+          (PatchCountPerInstance - 1) / PatchPerGroup + 1;
+      auto [_0, cp_buffer, cp_offset] = ctx.queue->AllocateTempBuffer(
+          currentChunkId,
+          ctx.tess_num_output_control_point_element * 16 *
+              IndexCountPerInstance * InstanceCount,
+          16);
+      auto [_1, pc_buffer, pc_offset] = ctx.queue->AllocateTempBuffer(
+          currentChunkId,
+          ctx.tess_num_output_patch_constant_scalar * 4 *
+              PatchCountPerInstance * InstanceCount,
+          4);
+      auto [_2, tess_factor_buffer, tess_factor_offset] =
+          ctx.queue->AllocateTempBuffer(
+              currentChunkId, 6 * 2 * PatchCountPerInstance * InstanceCount, 4);
+      encoder->setMeshBuffer(cp_buffer, cp_offset, 20);
+      encoder->setMeshBuffer(pc_buffer, pc_offset, 21);
+      encoder->setMeshBuffer(tess_factor_buffer, tess_factor_offset, 22);
+      encoder->setRenderPipelineState(ctx.tess_mesh_pso);
+
+      encoder->drawMeshThreadgroups(
+          MTL::Size(PatchPerMeshInstance, InstanceCount, 1),
+          MTL::Size(ctx.tess_threads_per_patch, 32 / ctx.tess_threads_per_patch,
+                    1),
+          MTL::Size(ctx.tess_threads_per_patch, 32 / ctx.tess_threads_per_patch,
+                    1));
+
+      encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageMesh,
+                             MTL::RenderStageVertex);
+
+      encoder->setRenderPipelineState(ctx.tess_raster_pso);
+      encoder->setVertexBuffer(cp_buffer, cp_offset, 20);
+      encoder->setVertexBuffer(pc_buffer, pc_offset, 21);
+      encoder->setVertexBuffer(tess_factor_buffer, tess_factor_offset, 22);
+      encoder->setTessellationFactorBuffer(tess_factor_buffer,
+                                           tess_factor_offset, 0 /* TODO: */);
+      encoder->drawPatches(0, 0,
+                           PatchCountPerInstance * InstanceCount, //
+                           nullptr, 0, 1, 0);
+    });
+  }
+
   void DrawIndexedInstancedIndirect(ID3D11Buffer *pBufferForArgs,
                                     UINT AlignedByteOffsetForArgs) override {
-    if (!ctx.PreDraw())
+    if (!ctx.PreDraw<true>())
       return;
     auto currentChunkId = cmd_queue.CurrentSeqId();
-    MTL::PrimitiveType Primitive =
+    auto [Primitive, ControlPointCount] =
         to_metal_topology(state_.InputAssembler.Topology);
     // TODO: skip invalid topology
+    if (ControlPointCount) {
+      return;
+    }
     auto IndexType =
         state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT
             ? MTL::IndexTypeUInt32
@@ -852,7 +918,25 @@ public:
 
   void DrawInstancedIndirect(ID3D11Buffer *pBufferForArgs,
                              UINT AlignedByteOffsetForArgs) override {
-    IMPLEMENT_ME
+    if (!ctx.PreDraw<true>())
+      return;
+    auto currentChunkId = cmd_queue.CurrentSeqId();
+    auto [Primitive, ControlPointCount] =
+        to_metal_topology(state_.InputAssembler.Topology);
+    if (ControlPointCount) {
+      return;
+    }
+    if (auto bindable = com_cast<IMTLBindable>(pBufferForArgs)) {
+      ctx.EmitRenderCommandChk(
+          [Primitive,
+           ArgBuffer = bindable->UseBindable(currentChunkId),
+           AlignedByteOffsetForArgs](CommandChunk::context &ctx) {
+            D3D11_ASSERT(ctx.current_index_buffer_ref);
+            ctx.render_encoder->drawPrimitives(
+                Primitive, ArgBuffer.buffer(),
+                AlignedByteOffsetForArgs);
+          });
+    }
   }
 
   void DrawAuto() override {
@@ -930,7 +1014,7 @@ public:
 
   void IASetInputLayout(ID3D11InputLayout *pInputLayout) override {
     if (auto expected = com_cast<IMTLD3D11InputLayout>(pInputLayout)) {
-      state_.InputAssembler.InputLayout = std::move(expected);
+      state_.InputAssembler.InputLayout = expected.ptr();
     } else {
       state_.InputAssembler.InputLayout = nullptr;
     }
@@ -938,7 +1022,12 @@ public:
   }
   void IAGetInputLayout(ID3D11InputLayout **ppInputLayout) override {
     if (ppInputLayout) {
-      *ppInputLayout = state_.InputAssembler.InputLayout.ref();
+      if (state_.InputAssembler.InputLayout) {
+        state_.InputAssembler.InputLayout->QueryInterface(
+            IID_PPV_ARGS(ppInputLayout));
+      } else {
+        *ppInputLayout = nullptr;
+      }
     }
   }
 
@@ -1592,16 +1681,21 @@ public:
         state_.OutputMerger.BlendState = expected.ptr();
         should_invalidate_pipeline = true;
       }
-      if (BlendFactor) {
-        memcpy(state_.OutputMerger.BlendFactor, BlendFactor, sizeof(float[4]));
-      } else {
-        state_.OutputMerger.BlendFactor[0] = 1.0f;
-        state_.OutputMerger.BlendFactor[1] = 1.0f;
-        state_.OutputMerger.BlendFactor[2] = 1.0f;
-        state_.OutputMerger.BlendFactor[3] = 1.0f;
+    } else {
+      if (state_.OutputMerger.BlendState) {
+        state_.OutputMerger.BlendState = nullptr;
+        should_invalidate_pipeline = true;
       }
     }
-    if(state_.OutputMerger.SampleMask != SampleMask) {
+    if (BlendFactor) {
+      memcpy(state_.OutputMerger.BlendFactor, BlendFactor, sizeof(float[4]));
+    } else {
+      state_.OutputMerger.BlendFactor[0] = 1.0f;
+      state_.OutputMerger.BlendFactor[1] = 1.0f;
+      state_.OutputMerger.BlendFactor[2] = 1.0f;
+      state_.OutputMerger.BlendFactor[3] = 1.0f;
+    }
+    if (state_.OutputMerger.SampleMask != SampleMask) {
       state_.OutputMerger.SampleMask = SampleMask;
       should_invalidate_pipeline = true;
     }
@@ -1632,9 +1726,11 @@ public:
     if (auto expected =
             com_cast<IMTLD3D11DepthStencilState>(pDepthStencilState)) {
       state_.OutputMerger.DepthStencilState = expected.ptr();
-      state_.OutputMerger.StencilRef = StencilRef;
-      ctx.dirty_state.set(ContextInternal::DirtyState::DepthStencilState);
+    } else {
+      state_.OutputMerger.DepthStencilState = nullptr;
     }
+    state_.OutputMerger.StencilRef = StencilRef;
+    ctx.dirty_state.set(ContextInternal::DirtyState::DepthStencilState);
   }
 
   void OMGetDepthStencilState(ID3D11DepthStencilState **ppDepthStencilState,
@@ -1894,17 +1990,15 @@ public:
   }
 
 private:
-  Obj<MTL::Device> metal_device_;
   D3D11ContextState state_;
 
-  CommandQueue cmd_queue;
+  CommandQueue &cmd_queue;
   ContextInternal ctx;
 
 public:
-  MTLD3D11DeviceContext(IMTLD3D11Device *pDevice)
-      : MTLD3D11DeviceContextBase(pDevice),
-        metal_device_(m_parent->GetMTLDevice()), state_(),
-        cmd_queue(metal_device_), ctx(pDevice, state_, cmd_queue) {}
+  MTLD3D11DeviceContext(IMTLD3D11Device *pDevice, CommandQueue &cmd_queue)
+      : MTLD3D11DeviceContextBase(pDevice), state_(), cmd_queue(cmd_queue),
+        ctx(pDevice, state_, cmd_queue) {}
 
   ~MTLD3D11DeviceContext() {}
 
@@ -1916,8 +2010,8 @@ public:
 };
 
 std::unique_ptr<MTLD3D11DeviceContextBase>
-InitializeImmediateContext(IMTLD3D11Device *pDevice) {
-  return std::make_unique<MTLD3D11DeviceContext>(pDevice);
+InitializeImmediateContext(IMTLD3D11Device *pDevice, CommandQueue &cmd_queue) {
+  return std::make_unique<MTLD3D11DeviceContext>(pDevice, cmd_queue);
 }
 
 } // namespace dxmt

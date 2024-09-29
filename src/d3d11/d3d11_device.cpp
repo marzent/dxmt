@@ -1,81 +1,60 @@
 #include "Metal/MTLPixelFormat.hpp"
 #include "Metal/MTLVertexDescriptor.hpp"
 #include "com/com_guid.hpp"
+#include "d3d11_input_layout.hpp"
 #include "d3d11_pipeline.hpp"
-#include "util_hash.hpp"
 #include "d3d11_class_linkage.hpp"
 #include "d3d11_inspection.hpp"
 #include "d3d11_context.hpp"
 #include "d3d11_context_state.hpp"
 #include "d3d11_device.hpp"
-#include "d3d11_input_layout.hpp"
+#include "d3d11_pipeline_cache.hpp"
 #include "d3d11_private.h"
 #include "d3d11_query.hpp"
 #include "d3d11_shader.hpp"
 #include "d3d11_swapchain.hpp"
 #include "d3d11_state_object.hpp"
 #include "dxgi_interfaces.h"
+#include "dxmt_command_queue.hpp"
 #include "dxmt_format.hpp"
+#include "dxmt_tasks.hpp"
 #include "ftl.hpp"
 #include "mtld11_resource.hpp"
 #include "thread.hpp"
-#include "threadpool.hpp"
 #include "winemacdrv.h"
 #include "dxgi_object.hpp"
-#include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 
-namespace std {
-template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
-  size_t operator()(const MTL_GRAPHICS_PIPELINE_DESC &v) const noexcept {
-    dxmt::HashState state;
-    state.add((size_t)v.VertexShader); // FIXME: don't use pointer?
-    state.add((size_t)v.PixelShader);  // FIXME: don't use pointer?
-    state.add((size_t)v.InputLayout);  // FIXME: don't use pointer?
-    /* IMTLD3D11BlendState pointer is safe to be used as hash input */
-    state.add((size_t)v.BlendState);
-    state.add((size_t)v.DepthStencilFormat);
-    state.add((size_t)v.NumColorAttachments);
-    for (unsigned i = 0; i < std::size(v.ColorAttachmentFormats); i++) {
-      state.add(i < v.NumColorAttachments ? v.ColorAttachmentFormats[i]
-                                          : MTL::PixelFormatInvalid);
-    }
-    return state;
-  };
-};
-template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
-  bool operator()(const MTL_GRAPHICS_PIPELINE_DESC &x,
-                  const MTL_GRAPHICS_PIPELINE_DESC &y) const {
-    if (x.NumColorAttachments != y.NumColorAttachments)
-      return false;
-    for (unsigned i = 0; i < x.NumColorAttachments; i++) {
-      if (x.ColorAttachmentFormats[i] != y.ColorAttachmentFormats[i])
-        return false;
-    }
-    return (x.BlendState == y.BlendState) &&
-           (x.VertexShader == y.VertexShader) &&
-           (x.PixelShader == y.PixelShader) &&
-           (x.InputLayout == y.InputLayout) &&
-           (x.DepthStencilFormat == y.DepthStencilFormat) &&
-           (x.RasterizationEnabled == y.RasterizationEnabled);
+namespace dxmt {
+
+template<>
+struct task_trait<IMTLThreadpoolWork*> {
+  IMTLThreadpoolWork* run_task(IMTLThreadpoolWork* task) {
+    return task->RunThreadpoolWork();
+  }
+  bool get_done(IMTLThreadpoolWork* task) {
+    return task->GetIsDone();
+  }
+  void set_done(IMTLThreadpoolWork* task) {
+    task->SetIsDone(true);
   }
 };
-} // namespace std
-
-namespace dxmt {
 
 class MTLD3D11Device final : public IMTLD3D11Device {
 public:
   MTLD3D11Device(MTLDXGIObject<IMTLDXGIDevice> *container,
                  IMTLDXGIAdatper *pAdapter, D3D_FEATURE_LEVEL FeatureLevel,
-                 UINT FeatureFlags)
+                 UINT FeatureFlags, CommandQueue &cmd_queue)
       : m_container(container), adapter_(pAdapter),
         m_FeatureLevel(FeatureLevel), m_FeatureFlags(FeatureFlags),
         m_features(container->GetMTLDevice()), sampler_states(this),
-        blend_states(this), rasterizer_states(this), depthstencil_states(this) {
-    context_ = InitializeImmediateContext(this);
+        rasterizer_states(this), depthstencil_states(this),
+        cmd_queue_(cmd_queue) {
+    pipeline_cache_ = InitializePipelineCache(this);
+    context_ = InitializeImmediateContext(this, cmd_queue);
+    is_traced_ = !!::GetModuleHandle("dxgitrace.dll");
   }
 
   ~MTLD3D11Device() {}
@@ -92,6 +71,8 @@ public:
   void AddRefPrivate() override { return m_container->AddRefPrivate(); }
 
   void ReleasePrivate() override { return m_container->ReleasePrivate(); }
+
+  bool IsTraced() override { return is_traced_; }
 
   HRESULT STDMETHODCALLTYPE
   CreateBuffer(const D3D11_BUFFER_DESC *pDesc,
@@ -242,9 +223,9 @@ public:
       return S_FALSE;
     }
 
-    return dxmt::CreateInputLayout(this, pShaderBytecodeWithInputSignature,
-                                   pInputElementDescs, NumElements,
-                                   ppInputLayout);
+    return pipeline_cache_->AddInputLayout(
+        pShaderBytecodeWithInputSignature, pInputElementDescs, NumElements,
+        (IMTLD3D11InputLayout **)ppInputLayout);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -255,13 +236,8 @@ public:
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
-    try {
-      return dxmt::CreateVertexShader(this, pShaderBytecode, BytecodeLength,
-                                      ppVertexShader);
-    } catch (const MTLD3DError &err) {
-      ERR(err.message());
-      return E_FAIL;
-    }
+    return pipeline_cache_->AddVertexShader(pShaderBytecode, BytecodeLength,
+                                            ppVertexShader);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -275,8 +251,9 @@ public:
     if (!ppGeometryShader)
       return S_FALSE;
     ERR("CreateGeometryShader: not supported, return a dummy");
-    return dxmt::CreateDummyGeometryShader(this, pShaderBytecode,
-                                           BytecodeLength, ppGeometryShader);
+
+    return pipeline_cache_->AddGeometryShader(pShaderBytecode, BytecodeLength,
+                                              ppGeometryShader);
   }
 
   HRESULT STDMETHODCALLTYPE CreateGeometryShaderWithStreamOutput(
@@ -314,13 +291,8 @@ public:
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
-    try {
-      return dxmt::CreatePixelShader(this, pShaderBytecode, BytecodeLength,
-                                     ppPixelShader);
-    } catch (const MTLD3DError &err) {
-      ERR(err.message());
-      return E_FAIL;
-    }
+    return pipeline_cache_->AddPixelShader(pShaderBytecode, BytecodeLength,
+                                           ppPixelShader);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -333,9 +305,9 @@ public:
 
     if (!ppHullShader)
       return S_FALSE;
-    ERR("CreateHullShader: not supported, return a dummy");
-    return dxmt::CreateDummyHullShader(this, pShaderBytecode, BytecodeLength,
-                                       ppHullShader);
+
+    return pipeline_cache_->AddHullShader(pShaderBytecode, BytecodeLength,
+                                          ppHullShader);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -348,9 +320,9 @@ public:
 
     if (!ppDomainShader)
       return S_FALSE;
-    ERR("CreateDomainShader: not supported, return a dummy");
-    return dxmt::CreateDummyDomainShader(this, pShaderBytecode, BytecodeLength,
-                                         ppDomainShader);
+
+    return pipeline_cache_->AddDomainShader(pShaderBytecode, BytecodeLength,
+                                            ppDomainShader);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -511,7 +483,7 @@ public:
     MTL_FORMAT_DESC metal_format;
 
     if (FAILED(adapter_->QueryFormatDesc(Format, &metal_format))) {
-      return S_OK;
+      return E_INVALIDARG;
     }
 
     UINT outFormatSupport = 0;
@@ -526,11 +498,15 @@ public:
 
     /* UNCHECKED */
     outFormatSupport |=
-        D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_TEXTURE1D |
-        D3D11_FORMAT_SUPPORT_TEXTURE2D | D3D11_FORMAT_SUPPORT_TEXTURE3D |
-        D3D11_FORMAT_SUPPORT_TEXTURECUBE | D3D11_FORMAT_SUPPORT_MIP |
-        D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | // ?
+        D3D11_FORMAT_SUPPORT_TEXTURE1D | D3D11_FORMAT_SUPPORT_TEXTURE2D |
+        D3D11_FORMAT_SUPPORT_TEXTURE3D | D3D11_FORMAT_SUPPORT_TEXTURECUBE |
+        D3D11_FORMAT_SUPPORT_MIP | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN | // ?
         D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
+
+    if (!metal_format.IsCompressed && !metal_format.Typeless &&
+        !metal_format.DepthStencilFlag) {
+      outFormatSupport |= D3D11_FORMAT_SUPPORT_BUFFER;
+    }
 
     if (metal_format.SupportBackBuffer) {
       outFormatSupport |= D3D11_FORMAT_SUPPORT_DISPLAY;
@@ -570,6 +546,18 @@ public:
     if (any_bit_set(metal_format.Capability & FormatCapability::Write)) {
       outFormatSupport |= D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW;
     }
+
+    if (Format == DXGI_FORMAT_R32_FLOAT || Format == DXGI_FORMAT_R32_UINT ||
+        Format == DXGI_FORMAT_R32_SINT || Format == DXGI_FORMAT_R32G32_FLOAT ||
+        Format == DXGI_FORMAT_R32G32_UINT ||
+        Format == DXGI_FORMAT_R32G32_SINT ||
+        Format == DXGI_FORMAT_R32G32B32_FLOAT ||
+        Format == DXGI_FORMAT_R32G32B32_UINT ||
+        Format == DXGI_FORMAT_R32G32B32_SINT ||
+        Format == DXGI_FORMAT_R32G32B32A32_FLOAT ||
+        Format == DXGI_FORMAT_R32G32B32A32_UINT ||
+        Format == DXGI_FORMAT_R32G32B32A32_SINT)
+      outFormatSupport |= D3D11_FORMAT_SUPPORT_SO_BUFFER;
 
     if (pFormatSupport) {
       *pFormatSupport = outFormatSupport;
@@ -632,13 +620,40 @@ public:
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
-            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
+            D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+            D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE |
+            D3D11_FORMAT_SUPPORT2_SHAREABLE;
         return S_OK;
       }
 
       MTL_FORMAT_DESC desc;
       if (FAILED(adapter_->QueryFormatDesc(info->InFormat, &desc))) {
+        info->OutFormatSupport2 |=
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_ADD |
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
+            D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+            D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE |
+            D3D11_FORMAT_SUPPORT2_SHAREABLE;
         return S_OK;
+      }
+
+      if (any_bit_set(desc.Capability & FormatCapability::TextureBufferRead)) {
+        info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+      }
+
+      if (any_bit_set(desc.Capability & FormatCapability::TextureBufferWrite)) {
+        info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+      }
+
+      if (any_bit_set(desc.Capability &
+                      FormatCapability::TextureBufferReadWrite)) {
+        info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD |
+                                   D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE;
       }
 
       if (any_bit_set(desc.Capability & FormatCapability::Atomic)) {
@@ -648,13 +663,16 @@ public:
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_EXCHANGE |
             D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_SIGNED_MIN_OR_MAX |
-            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX;
+            D3D11_FORMAT_SUPPORT2_UAV_ATOMIC_UNSIGNED_MIN_OR_MAX |
+            D3D11_FORMAT_SUPPORT2_SHAREABLE;
+      }
 
 #ifndef DXMT_NO_PRIVATE_API
+      if (any_bit_set(desc.Capability & FormatCapability::Blend)) {
         /* UNCHECKED */
         info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP;
-#endif
       }
+#endif
 
       if (any_bit_set(desc.Capability & FormatCapability::Sparse)) {
         info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_TILED;
@@ -723,7 +741,7 @@ public:
   HRESULT STDMETHODCALLTYPE
       CreateBlendState1(const D3D11_BLEND_DESC1 *pBlendStateDesc,
                         ID3D11BlendState1 **ppBlendState) override {
-    return blend_states.CreateStateObject(pBlendStateDesc,
+    return pipeline_cache_->AddBlendState(pBlendStateDesc,
                                           (IMTLD3D11BlendState **)ppBlendState);
   }
 
@@ -801,10 +819,10 @@ public:
     if (Flags) {
       IMPLEMENT_ME;
     }
+    *pNumQualityLevels = 0;
     MTL_FORMAT_DESC desc;
     adapter_->QueryFormatDesc(Format, &desc);
     if (desc.PixelFormat == MTL::PixelFormatInvalid) {
-      *pNumQualityLevels = 0;
       return E_INVALIDARG;
     }
 
@@ -819,9 +837,8 @@ public:
     if (GetMTLDevice()->supportsTextureSampleCount(SampleCount)) {
       *pNumQualityLevels = 1; // always 1: in metal there is no concept of
                               // Quality Level (so is it in vulkan iirc)
-      return S_OK;
     }
-    return S_FALSE;
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -983,35 +1000,14 @@ public:
     *ppAdapter = ref(adapter_);
   }
 
-  void SubmitThreadgroupWork(IMTLThreadpoolWork *pWork,
-                             THREADGROUP_WORK_STATE *pState) override {
-    D3D11_ASSERT(pWork->AddRef() > 1 &&
-                 "otherwise there is a risk the object get destoryed before "
-                 "this call return");
-    pool_.enqueue(pWork, pState);
-  }
-
-  void WaitThreadgroupWork(THREADGROUP_WORK_STATE *pState) override {
-    pool_.wait(pState);
+  void SubmitThreadgroupWork(IMTLThreadpoolWork *pWork) override {
+    scheduler_.submit(pWork);
   }
 
   HRESULT
   CreateGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
                          IMTLCompiledGraphicsPipeline **ppPipeline) override {
-    std::lock_guard<dxmt::mutex> lock(mutex_);
-
-    auto iter = pipelines_.find(*pDesc);
-    if (iter != pipelines_.end()) {
-      *ppPipeline = iter->second.ref();
-      return S_OK;
-    }
-    auto temp = dxmt::CreateGraphicsPipeline(
-        this, pDesc->VertexShader, pDesc->PixelShader, pDesc->InputLayout,
-        pDesc->BlendState, pDesc->NumColorAttachments,
-        pDesc->ColorAttachmentFormats, pDesc->DepthStencilFormat,
-        pDesc->RasterizationEnabled);
-    D3D11_ASSERT(pipelines_.insert({*pDesc, temp}).second); // copy
-    *ppPipeline = std::move(temp);                          // move
+    pipeline_cache_->GetGraphicsPipeline(pDesc, ppPipeline);
     return S_OK;
   };
 
@@ -1031,30 +1027,47 @@ public:
     return S_OK;
   };
 
+  HRESULT
+  CreateTessellationPipeline(
+      MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+      IMTLCompiledTessellationPipeline **ppPipeline) override {
+    pipeline_cache_->GetTessellationPipeline(pDesc, ppPipeline);
+    return S_OK;
+  };
+
+  uint64_t AloocateCounter(uint32_t InitialValue) override {
+    return cmd_queue_.counter_pool.AllocateCounter(cmd_queue_.CurrentSeqId(),
+                                                   InitialValue);
+  }
+
+  void DiscardCounter(uint64_t ConterHandle) override {
+    cmd_queue_.counter_pool.DiscardCounter(cmd_queue_.CurrentSeqId(),
+                                           ConterHandle);
+  }
+
 private:
   MTLDXGIObject<IMTLDXGIDevice> *m_container;
   IMTLDXGIAdatper *adapter_;
   D3D_FEATURE_LEVEL m_FeatureLevel;
   UINT m_FeatureFlags;
   MTLD3D11Inspection m_features;
-  threadpool<threadpool_trait> pool_;
 
-  std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC,
-                     Com<IMTLCompiledGraphicsPipeline>>
-      pipelines_;
-  dxmt::mutex mutex_;
+  task_scheduler<IMTLThreadpoolWork*> scheduler_;
+
+  bool is_traced_;
 
   std::unordered_map<IMTLCompiledShader *, Com<IMTLCompiledComputePipeline>>
       pipelines_cs_;
   dxmt::mutex mutex_cs_;
 
   StateObjectCache<D3D11_SAMPLER_DESC, IMTLD3D11SamplerState> sampler_states;
-  StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
   StateObjectCache<D3D11_RASTERIZER_DESC2, IMTLD3D11RasterizerState>
       rasterizer_states;
   StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>
       depthstencil_states;
 
+  std::unique_ptr<MTLD3D11PipelineCacheBase> pipeline_cache_;
+  CommandQueue& cmd_queue_;
   /** ensure destructor called first */
   std::unique_ptr<MTLD3D11DeviceContextBase> context_;
 };
@@ -1071,8 +1084,9 @@ public:
 
   MTLD3D11DXGIDevice(IMTLDXGIAdatper *adapter, D3D_FEATURE_LEVEL feature_level,
                      UINT feature_flags)
-      : adapter_(adapter),
-        d3d11_device_(this, adapter, feature_level, feature_flags) {}
+      : adapter_(adapter), cmd_queue_(adapter->GetMTLDevice()),
+        d3d11_device_(this, adapter, feature_level, feature_flags, cmd_queue_) {
+  }
 
   ~MTLD3D11DXGIDevice() override {}
 
@@ -1154,11 +1168,17 @@ public:
     return S_OK;
   }
 
-  HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override{
-      IMPLEMENT_ME}
+  HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override {
+    max_latency_ = MaxLatency;
+    return S_OK;
+  }
 
-  HRESULT STDMETHODCALLTYPE
-      GetMaximumFrameLatency(UINT *pMaxLatency) override{IMPLEMENT_ME}
+  HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT *pMaxLatency) override {
+    if (pMaxLatency) {
+      *pMaxLatency = max_latency_;
+    }
+    return S_OK;
+  }
 
   HRESULT STDMETHODCALLTYPE
       OfferResources(UINT NumResources, IDXGIResource *const *ppResources,
@@ -1234,7 +1254,9 @@ public:
 
 private:
   Com<IMTLDXGIAdatper> adapter_;
+  CommandQueue cmd_queue_;
   MTLD3D11Device d3d11_device_;
+  uint32_t max_latency_ = 3;
 };
 
 Com<IMTLDXGIDevice> CreateD3D11Device(IMTLDXGIAdatper *adapter,

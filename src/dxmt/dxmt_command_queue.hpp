@@ -9,7 +9,9 @@
 #include "Metal/MTLDevice.hpp"
 #include "Metal/MTLTypes.hpp"
 #include "dxmt_binding.hpp"
+#include "dxmt_capture.hpp"
 #include "dxmt_command.hpp"
+#include "dxmt_counter_pool.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_ring_bump_allocator.hpp"
 #include "log/log.hpp"
@@ -28,6 +30,12 @@ enum class EncoderKind : uint32_t { Nil, ClearPass, Render, Compute, Blit, Resol
 struct ENCODER_INFO {
   EncoderKind kind;
   uint64_t encoder_id;
+};
+
+struct ENCODER_RENDER_INFO {
+  EncoderKind kind = EncoderKind::Render;
+  uint64_t encoder_id;
+  uint32_t tessellation_pass = 0;
 };
 
 struct ENCODER_CLEARPASS_INFO {
@@ -86,7 +94,7 @@ inline void *ptr_add(const void *const p,
 
 constexpr uint32_t kCommandChunkCount = 8;
 constexpr size_t kCommandChunkCPUHeapSize = 0x800000; // is 8MB too large?
-constexpr size_t kCommandChunkGPUHeapSize = 0x200000;
+constexpr size_t kCommandChunkGPUHeapSize = 0x400000;
 constexpr size_t kOcclusionSampleCount = 1024;
 
 class CommandQueue;
@@ -164,6 +172,12 @@ class CommandChunk {
     MTL::Buffer *current_index_buffer_ref{};
     uint32_t dsv_planar_flags = 0;
 
+    MTL::RenderPipelineState* tess_mesh_pso;
+    MTL::RenderPipelineState* tess_raster_pso;
+    uint32_t tess_num_output_control_point_element;
+    uint32_t tess_num_output_patch_constant_scalar;
+    uint32_t tess_threads_per_patch;
+
     context_t(CommandChunk *chk, MTL::CommandBuffer *cmdbuf)
         : chk(chk), queue(chk->queue), cmdbuf(cmdbuf) {}
 
@@ -239,6 +253,8 @@ public:
       cur = cur->next;
     }
   };
+
+  ENCODER_RENDER_INFO *mark_render_pass();
 
   ENCODER_CLEARPASS_INFO *mark_clear_pass();
 
@@ -328,9 +344,11 @@ private:
 
   RingBumpAllocator<true> staging_allocator;
   RingBumpAllocator<false> copy_temp_allocator;
+  CaptureState capture_state;
 
 public:
   DXMTCommandContext clear_cmd;
+  CounterPool counter_pool;
 
   CommandQueue(MTL::Device *device);
 

@@ -5,6 +5,8 @@
 #include "d3d11_3.h"
 #include "d3d11_device.hpp"
 #include "d3d11_device_child.hpp"
+#include "thread.hpp"
+#include "util_hash.hpp"
 
 DEFINE_COM_INTERFACE("77f0bbd5-2be7-4e9e-ad61-70684ff19e01",
                      IMTLD3D11SamplerState)
@@ -18,6 +20,7 @@ DEFINE_COM_INTERFACE("03629ed8-bcdd-4582-8997-3817209a34f4",
     : public ID3D11RasterizerState2 {
   virtual void SetupRasterizerState(MTL::RenderCommandEncoder * encoder) = 0;
   virtual bool IsScissorEnabled() = 0;
+  virtual uint32_t UAVOnlySampleCount() = 0;
 };
 
 DEFINE_COM_INTERFACE("b01aaffa-b4d3-478a-91be-6195f215aaba",
@@ -30,6 +33,7 @@ DEFINE_COM_INTERFACE("b01aaffa-b4d3-478a-91be-6195f215aaba",
 DEFINE_COM_INTERFACE("279a1d66-2fc1-460c-a0a7-a7a5f2b7a48f",
                      IMTLD3D11BlendState)
     : public ID3D11BlendState1 {
+  virtual bool IsDualSourceBlending() = 0;
   virtual void SetupMetalPipelineDescriptor(MTL::RenderPipelineDescriptor *
                                             render_pipeline_descriptor) = 0;
 };
@@ -54,18 +58,68 @@ template <> struct equal_to<D3D11_SAMPLER_DESC> {
 
 template <> struct hash<D3D11_BLEND_DESC1> {
   size_t operator()(const D3D11_BLEND_DESC1 &v) const noexcept {
-    constexpr size_t binsize = sizeof(v);
-    return std::hash<string_view>{}(
-        {reinterpret_cast<const char *>(&v), binsize});
+    dxmt::HashState hash;
+    hash.add((v.IndependentBlendEnable << 1) | v.AlphaToCoverageEnable);
+    uint32_t num_blend_target = v.IndependentBlendEnable ? 8 : 1;
+    for (unsigned i = 0; i < num_blend_target; i++) {
+      auto &blend_target = v.RenderTarget[i];
+      hash.add(blend_target.RenderTargetWriteMask);
+      hash.add(blend_target.BlendEnable);
+      hash.add(blend_target.LogicOpEnable);
+      if (blend_target.BlendEnable) {
+        hash.add(blend_target.BlendOp);
+        hash.add(blend_target.BlendOpAlpha);
+        hash.add(blend_target.SrcBlend);
+        hash.add(blend_target.SrcBlendAlpha);
+        hash.add(blend_target.DestBlend);
+        hash.add(blend_target.DestBlendAlpha);
+      }
+      if (blend_target.LogicOpEnable) {
+        hash.add(blend_target.LogicOp);
+      }
+    }
+    return hash;
   };
 };
 
 template <> struct equal_to<D3D11_BLEND_DESC1> {
   bool operator()(const D3D11_BLEND_DESC1 &x,
                   const D3D11_BLEND_DESC1 &y) const {
-    constexpr size_t binsize = sizeof(x);
-    return std::string_view({reinterpret_cast<const char *>(&x), binsize}) ==
-           std::string_view({reinterpret_cast<const char *>(&y), binsize});
+    if (x.IndependentBlendEnable != y.IndependentBlendEnable)
+      return false;
+    if (x.AlphaToCoverageEnable != y.AlphaToCoverageEnable)
+      return false;
+    uint32_t num_blend_target = x.IndependentBlendEnable ? 8 : 1;
+    for (unsigned i = 0; i < num_blend_target; i++) {
+      auto &blend_target_x = x.RenderTarget[i];
+      auto &blend_target_y = y.RenderTarget[i];
+      if (blend_target_x.RenderTargetWriteMask !=
+          blend_target_y.RenderTargetWriteMask)
+        return false;
+      if (blend_target_x.BlendEnable != blend_target_y.BlendEnable)
+        return false;
+      if (blend_target_x.LogicOpEnable != blend_target_y.LogicOpEnable)
+        return false;
+      if (blend_target_x.BlendEnable) {
+        if (blend_target_x.BlendOp != blend_target_y.BlendOp)
+          return false;
+        if (blend_target_x.BlendOpAlpha != blend_target_y.BlendOpAlpha)
+          return false;
+        if (blend_target_x.SrcBlend != blend_target_y.SrcBlend)
+          return false;
+        if (blend_target_x.SrcBlendAlpha != blend_target_y.SrcBlendAlpha)
+          return false;
+        if (blend_target_x.DestBlend != blend_target_y.DestBlend)
+          return false;
+        if (blend_target_x.DestBlendAlpha != blend_target_y.DestBlendAlpha)
+          return false;
+      }
+      if (blend_target_x.LogicOpEnable) {
+        if (blend_target_x.LogicOp != blend_target_y.LogicOp)
+          return false;
+      }
+    }
+    return true;
   }
 };
 template <> struct hash<D3D11_RASTERIZER_DESC2> {

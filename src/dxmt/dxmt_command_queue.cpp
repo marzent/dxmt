@@ -9,6 +9,15 @@
 
 namespace dxmt {
 
+ENCODER_RENDER_INFO *CommandChunk::mark_render_pass() {
+  linear_allocator<ENCODER_RENDER_INFO> allocator(this);
+  auto ptr = allocator.allocate(1);
+  new (ptr) ENCODER_RENDER_INFO();
+  ptr->encoder_id = queue->GetNextEncoderId();
+  last_encoder_info = (ENCODER_INFO *)ptr;
+  return ptr;
+};
+
 ENCODER_CLEARPASS_INFO *CommandChunk::mark_clear_pass() {
   linear_allocator<ENCODER_CLEARPASS_INFO> allocator(this);
   auto ptr = allocator.allocate(1);
@@ -35,7 +44,7 @@ CommandQueue::CommandQueue(MTL::Device *device)
                                     MTL::ResourceStorageModeShared),
       copy_temp_allocator(device, MTL::ResourceHazardTrackingModeUntracked |
                                       MTL::ResourceStorageModePrivate),
-      clear_cmd(device) {
+      clear_cmd(device), counter_pool(device) {
   commandQueue = transfer(device->newCommandQueue(kCommandChunkCount));
   for (unsigned i = 0; i < kCommandChunkCount; i++) {
     auto &chunk = chunks[i];
@@ -53,6 +62,15 @@ CommandQueue::CommandQueue(MTL::Device *device)
         (uint64_t *)chunk.gpu_argument_heap->contents();
     chunk.reset();
   };
+
+  std::string env = env::getEnvVar("DXMT_CAPTURE_FRAME");
+
+  if (!env.empty()) {
+    try {
+      capture_state.scheduleNextFrameCapture(std::stoull(env));
+    } catch (const std::invalid_argument &) {
+    }
+  }
 }
 
 CommandQueue::~CommandQueue() {
@@ -97,40 +115,46 @@ void CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
 
   auto pool = transfer(NS::AutoreleasePool::alloc()->init());
 
-  // TODO:
-  bool should_capture = false;
-
-  auto c = MTL::CaptureManager::sharedCaptureManager();
-  if (should_capture) {
-    auto d = transfer(MTL::CaptureDescriptor::alloc()->init());
-    d->setCaptureObject(commandQueue->device());
-    d->setDestination(MTL::CaptureDestinationGPUTraceDocument);
+  switch (capture_state.getNextAction(chunk.frame_)) {
+  case CaptureState::NextAction::StartCapture: {
+    auto capture_mgr = MTL::CaptureManager::sharedCaptureManager();
+    auto capture_desc = transfer(MTL::CaptureDescriptor::alloc()->init());
+    capture_desc->setCaptureObject(commandQueue->device());
+    capture_desc->setDestination(MTL::CaptureDestinationGPUTraceDocument);
     char filename[1024];
     std::time_t now;
     std::time(&now);
-    // TODO: absolute path? not a good idea
-    std::strftime(filename, 1024,
-                  "/Users/sanshain/capture-%H-%M-%S_%m-%d-%y.gputrace",
+    std::strftime(filename, 1024, "-capture-%H-%M-%S_%m-%d-%y.gputrace",
                   std::localtime(&now));
-    auto _pTraceSaveFilePath =
-        (NS::String::string(filename, NS::UTF8StringEncoding));
-    NS::URL *pURL = NS::URL::alloc()->initFileURLWithPath(_pTraceSaveFilePath);
+    auto fileUrl = env::getUnixPath(env::getExeBaseName() + filename);
+    WARN("A new capture will be saved to " ,fileUrl);
+    NS::URL *pURL = NS::URL::alloc()->initFileURLWithPath(
+        NS::String::string(fileUrl.c_str(), NS::UTF8StringEncoding));
 
     NS::Error *pError = nullptr;
-    d->setOutputURL(pURL);
+    capture_desc->setOutputURL(pURL);
 
-    c->startCapture(d.ptr(), &pError);
+    capture_mgr->startCapture(capture_desc.ptr(), &pError);
+    break;
+  }
+  case CaptureState::NextAction::StopCapture: {
+    auto capture_mgr = MTL::CaptureManager::sharedCaptureManager();
+    capture_mgr->stopCapture();
+    break;
+  }
+  case CaptureState::NextAction::Nothing: {
+    if (CaptureState::shouldCaptureNextFrame()) {
+      capture_state.scheduleNextFrameCapture(chunk.frame_ + 1);
+    }
+    break;
+  }
   }
 
   chunk.attached_cmdbuf = commandQueue->commandBuffer();
   auto cmdbuf = chunk.attached_cmdbuf;
+  counter_pool.FillCounters(seq, cmdbuf);
   chunk.encode(cmdbuf);
   cmdbuf->commit();
-
-  if (should_capture) {
-
-    c->stopCapture();
-  }
 
   ready_for_commit.fetch_add(1, std::memory_order_release);
   ready_for_commit.notify_one();
@@ -139,6 +163,7 @@ void CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
 uint32_t CommandQueue::EncodingThread() {
 #if ASYNC_ENCODING
   env::setThreadName("dxmt-encode-thread");
+  __pthread_set_qos_class_self_np(__QOS_CLASS_USER_INTERACTIVE, 0);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
@@ -157,6 +182,7 @@ uint32_t CommandQueue::EncodingThread() {
 
 uint32_t CommandQueue::WaitForFinishThread() {
   env::setThreadName("dxmt-finish-thread");
+  __pthread_set_qos_class_self_np(__QOS_CLASS_USER_INTERACTIVE, 0);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   uint64_t internal_seq = 1;
   while (!stopped.load()) {
@@ -201,6 +227,8 @@ uint32_t CommandQueue::WaitForFinishThread() {
     chunk_ongoing.notify_one();
 
     staging_allocator.free_blocks(internal_seq);
+    copy_temp_allocator.free_blocks(internal_seq);
+    counter_pool.ReleaseCounters(internal_seq);
 
     internal_seq++;
   }

@@ -8,687 +8,14 @@
 #include <variant>
 #include <vector>
 
+#include "air_operations.hpp"
 #include "air_signature.hpp"
+#include "airconv_public.h"
+#include "dxbc_constants.hpp"
+#include "dxbc_instructions.hpp"
 #include "shader_common.hpp"
 
 namespace dxmt::dxbc {
-
-struct Swizzle {
-  union {
-    uint8_t x;
-    uint8_t r;
-  };
-  union {
-    uint8_t y;
-    uint8_t g;
-  };
-  union {
-    uint8_t z;
-    uint8_t b;
-  };
-  union {
-    uint8_t w;
-    uint8_t a;
-  };
-  bool operator==(Swizzle const &o) const {
-    return r == o.r && g == o.g && b == o.b && a == o.a;
-  };
-
-  operator std::array<int, 4>() const { return std::array<int, 4>{x, y, z, w}; }
-};
-
-constexpr Swizzle swizzle_identity = {0, 1, 2, 3};
-
-#pragma region operand index
-struct IndexByTempComponent {
-  uint32_t regid;
-  uint8_t component;
-  uint32_t offset;
-};
-
-struct IndexByIndexableTempComponent {
-  uint32_t regfile;
-  uint32_t regid;
-  uint8_t component;
-  uint32_t offset;
-};
-
-using OperandIndex =
-  std::variant<uint32_t, IndexByIndexableTempComponent, IndexByTempComponent>;
-#pragma endregion
-
-#pragma region source operand
-
-struct SrcOperandModifier {
-  Swizzle swizzle;
-  bool abs;
-  bool neg;
-};
-
-struct SrcOperandImmediate32 {
-  static constexpr std::string_view debug_name = "immediate_32";
-  union {
-    int32_t ivalue[4];
-    uint32_t uvalue[4];
-    float fvalue[4];
-  };
-};
-
-struct SrcOperandTemp {
-  static constexpr std::string_view debug_name = "temp";
-  SrcOperandModifier _;
-  uint32_t regid;
-};
-
-struct SrcOperandIndexableTemp {
-  static constexpr std::string_view debug_name = "indexable_temp";
-  SrcOperandModifier _;
-  uint32_t regfile;
-  OperandIndex regindex;
-};
-
-struct SrcOperandInput {
-  static constexpr std::string_view debug_name = "input";
-  SrcOperandModifier _;
-  uint32_t regid;
-};
-
-struct SrcOperandIndexableInput {
-  static constexpr std::string_view debug_name = "indexable_input";
-  SrcOperandModifier _;
-  OperandIndex regindex;
-};
-
-struct SrcOperandConstantBuffer {
-  static constexpr std::string_view debug_name = "constant_buffer";
-  SrcOperandModifier _;
-  uint32_t rangeid;
-  OperandIndex rangeindex;
-  OperandIndex regindex;
-};
-
-struct SrcOperandImmediateConstantBuffer {
-  static constexpr std::string_view debug_name = "immediate_constant_buffer";
-  SrcOperandModifier _;
-  OperandIndex regindex;
-};
-
-struct SrcOperandAttribute {
-  static constexpr std::string_view debug_name = "attribute";
-  SrcOperandModifier _;
-  shader::common::InputAttribute attribute;
-};
-
-#pragma endregion
-
-#pragma region dest operand
-
-struct DstOperandCommon {
-  uint32_t mask;
-};
-
-struct DstOperandNull {
-  static constexpr std::string_view debug_name = "null";
-  DstOperandCommon _;
-};
-
-struct DstOperandSideEffect {
-  static constexpr std::string_view debug_name = "side_effect";
-  DstOperandCommon _;
-};
-
-struct DstOperandTemp {
-  static constexpr std::string_view debug_name = "temp";
-  DstOperandCommon _;
-  uint32_t regid;
-};
-
-struct DstOperandIndexableTemp {
-  static constexpr std::string_view debug_name = "indexable_temp";
-  DstOperandCommon _;
-  uint32_t regfile;
-  OperandIndex regindex;
-};
-
-struct DstOperandOutput {
-  static constexpr std::string_view debug_name = "output";
-  DstOperandCommon _;
-  uint32_t regid;
-};
-
-struct DstOperandOutputDepth {
-  static constexpr std::string_view debug_name = "odepth";
-  DstOperandCommon _;
-};
-
-struct DstOperandOutputCoverageMask {
-  static constexpr std::string_view debug_name = "omask";
-  DstOperandCommon _;
-};
-
-#pragma endregion
-
-#pragma region instructions
-struct InstructionCommon {
-  bool saturate;
-};
-
-struct DclConstantBuffer {};
-
-struct DclResource {};
-
-struct DclRawResource {};
-
-struct DclStructuredResource {};
-
-struct DclInput {};
-
-struct DclOutput {};
-
-#pragma endregion
-
-using SrcOperand = std::variant<
-  SrcOperandImmediate32, SrcOperandTemp, SrcOperandIndexableTemp,
-  SrcOperandInput, SrcOperandConstantBuffer, SrcOperandImmediateConstantBuffer,
-  SrcOperandAttribute, SrcOperandIndexableInput>;
-
-struct SrcOperandResource {
-  uint32_t range_id;
-  OperandIndex index;
-  Swizzle read_swizzle;
-};
-
-struct SrcOperandSampler {
-  uint32_t range_id;
-  OperandIndex index;
-  uint8_t gather_channel;
-};
-
-struct SrcOperandUAV {
-  uint32_t range_id;
-  OperandIndex index;
-  Swizzle read_swizzle;
-};
-
-struct SrcOperandTGSM {
-  uint32_t id;
-  Swizzle read_swizzle;
-};
-
-struct AtomicDstOperandUAV {
-  uint32_t range_id;
-  OperandIndex index;
-  uint32_t mask;
-};
-
-/**
-It's a UAV implemented as metal buffer
-*/
-struct AtomicDstOperandUAVBuffer {
-  uint32_t range_id;
-  OperandIndex index;
-  uint32_t mask;
-};
-
-struct AtomicOperandTGSM {
-  uint32_t id;
-  uint32_t mask;
-};
-
-using DstOperand = std::variant<
-  DstOperandNull, DstOperandSideEffect, DstOperandTemp, DstOperandIndexableTemp,
-  DstOperandOutput, DstOperandOutputDepth, DstOperandOutputCoverageMask>;
-
-#pragma mark mov instructions
-namespace {
-struct InstMov {
-  InstructionCommon _;
-  DstOperand dst;
-  SrcOperand src;
-};
-
-struct InstMovConditional {
-  InstructionCommon _;
-  DstOperand dst;
-  SrcOperand src_cond;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-struct InstSwapConditional {
-  DstOperand dst0;
-  DstOperand dst1;
-  SrcOperand src_cond;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-} // namespace
-
-#pragma mark resource instructions
-namespace {
-
-struct InstSample {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  int32_t offsets[3];
-  std::optional<SrcOperand> min_lod_clamp;
-  std::optional<DstOperand> feedback;
-};
-
-struct InstSampleCompare {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource; // swizzle must be .r channel
-  SrcOperandSampler src_sampler;
-  SrcOperand src_reference;
-  int32_t offsets[3];
-  std::optional<SrcOperand> min_lod_clamp;
-  std::optional<DstOperand> feedback;
-  bool level_zero;
-};
-
-struct InstSampleBias {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  SrcOperand src_bias;
-  int32_t offsets[3];
-};
-
-struct InstSampleDerivative {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  SrcOperand src_x_derivative;
-  SrcOperand src_y_derivative;
-  int32_t offsets[3];
-};
-
-struct InstSampleLOD {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  SrcOperand src_lod;
-  int32_t offsets[3];
-};
-
-struct InstGather {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  SrcOperand offset;
-  std::optional<DstOperand> feedback;
-};
-
-struct InstGatherCompare {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-  SrcOperand src_reference; // single component
-  SrcOperand offset;
-  std::optional<DstOperand> feedback;
-};
-
-struct InstBufferInfo {
-  DstOperand dst;
-  std::variant<SrcOperandResource, SrcOperandUAV> src;
-};
-
-struct InstResourceInfo {
-  DstOperand dst;
-  SrcOperand src_mip_level;
-  std::variant<SrcOperandResource, SrcOperandUAV> src_resource;
-  enum class M { none, uint, rcp } modifier;
-};
-struct InstSampleInfo {
-  DstOperand dst;
-  std::optional<SrcOperandResource> src; // if null, get rasterizer info
-  bool uint_result;
-};
-
-struct InstSamplePos {
-  DstOperand dst;
-  std::optional<SrcOperandResource> src; // if null, get rasterizer info
-  SrcOperand src_sample_index;
-};
-
-struct InstLoad {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  std::optional<SrcOperand> src_sample_index;
-  int32_t offsets[3];
-};
-
-struct InstLoadRaw {
-  DstOperand dst;
-  SrcOperand src_byte_offset;
-  std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> src;
-  // then we can load 4 components at once
-  bool opt_flag_offset_is_vec4_aligned = false;
-};
-
-struct InstLoadStructured {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperand src_byte_offset;
-  std::variant<SrcOperandResource, SrcOperandUAV, SrcOperandTGSM> src;
-  // 2nd condtion: stride is also vec4 aligned
-  bool opt_flag_offset_is_vec4_aligned = false;
-};
-
-struct InstLoadUAVTyped {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandUAV src_uav;
-};
-
-struct InstStoreUAVTyped {
-  AtomicDstOperandUAV dst;
-  SrcOperand src_address;
-  SrcOperand src;
-};
-
-struct InstStoreRaw {
-  std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> dst;
-  SrcOperand dst_byte_offset;
-  SrcOperand src;
-};
-
-struct InstStoreStructured {
-  std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> dst;
-  SrcOperand dst_address;
-  SrcOperand dst_byte_offset;
-  SrcOperand src;
-};
-
-} // namespace
-
-struct InstDotProduct {
-  InstructionCommon _;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  uint8_t dimension;
-};
-
-struct InstSinCos {
-  InstructionCommon _;
-  DstOperand dst_sin;
-  DstOperand dst_cos;
-  SrcOperand src;
-};
-
-enum class FloatComparison { Equal, NotEqual, GreaterEqual, LessThan };
-
-struct InstFloatCompare {
-  InstructionCommon _;
-  FloatComparison cmp;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-enum class IntegerComparison {
-  Equal,
-  NotEqual,
-  SignedLessThan,
-  SignedGreaterEqual,
-  UnsignedLessThan,
-  UnsignedGreaterEqual,
-};
-
-struct InstIntegerCompare {
-  IntegerComparison cmp;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-enum class FloatBinaryOp {
-  Add,
-  Mul,
-  Div,
-  Min,
-  Max,
-};
-
-struct InstFloatBinaryOp {
-  InstructionCommon _;
-  FloatBinaryOp op;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-enum class FloatUnaryOp {
-  Log2,
-  Exp2,
-  Rcp,
-  Rsq,
-  Sqrt,
-  Fraction,
-  RoundNearestEven,
-  RoundNegativeInf,
-  RoundPositiveInf,
-  RoundZero,
-};
-
-struct InstFloatUnaryOp {
-  InstructionCommon _;
-  FloatUnaryOp op;
-  DstOperand dst;
-  SrcOperand src;
-};
-
-enum class IntegerUnaryOp {
-  Neg,
-  Not,
-  ReverseBits,
-  CountBits,
-  FirstHiBitSigned,
-  FirstHiBit,
-  FirstLowBit,
-};
-
-struct InstIntegerUnaryOp {
-  IntegerUnaryOp op;
-  DstOperand dst;
-  SrcOperand src;
-};
-
-struct InstFloatMAD {
-  InstructionCommon _;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  SrcOperand src2;
-};
-
-struct InstIntegerMAD {
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  SrcOperand src2;
-  bool is_signed;
-};
-
-struct InstMaskedSumOfAbsDiff {
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  SrcOperand src2;
-};
-
-enum class IntegerBinaryOp {
-  UMin,
-  UMax,
-  IMin,
-  IMax,
-  IShl,
-  IShr,
-  UShr,
-  Xor,
-  Or,
-  And,
-  Add,
-};
-
-struct InstIntegerBinaryOp {
-  IntegerBinaryOp op;
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-enum class IntegerBinaryOpWithTwoDst {
-  IMul,
-  UAddCarry,
-  UDiv,
-  UMul,
-  USubBorrow,
-};
-
-struct InstIntegerBinaryOpWithTwoDst {
-  InstructionCommon _;
-  IntegerBinaryOpWithTwoDst op;
-  union {
-    DstOperand dst_hi;
-    DstOperand dst_quot;
-  };
-  union {
-    DstOperand dst_low;
-    DstOperand dst_rem;
-    DstOperand dst_carry; // 1 if a carry is produced, 0 otherwise.
-  };
-  SrcOperand src0;
-  SrcOperand src1;
-};
-
-struct InstExtractBits {
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  SrcOperand src2;
-  bool is_signed;
-};
-
-struct InstBitFiledInsert {
-  DstOperand dst;
-  SrcOperand src0;
-  SrcOperand src1;
-  SrcOperand src2;
-  SrcOperand src3;
-};
-
-enum class ConversionOp {
-  HalfToFloat,
-  FloatToHalf,
-  FloatToSigned,
-  SignedToFloat,
-  FloatToUnsigned,
-  UnsignedToFloat,
-};
-
-struct InstConvert {
-  ConversionOp op;
-  DstOperand dst;
-  SrcOperand src;
-};
-
-struct InstNop {};
-
-struct InstPixelDiscard {};
-
-struct InstPartialDerivative {
-  InstructionCommon _;
-  DstOperand dst;
-  SrcOperand src;
-  bool ddy;    // use ddx if false
-  bool coarse; // use fine if false
-};
-
-struct InstCalcLOD {
-  DstOperand dst;
-  SrcOperand src_address;
-  SrcOperandResource src_resource;
-  SrcOperandSampler src_sampler;
-};
-
-struct InstSync {
-  enum class Boundary { global, group } boundary;
-  bool threadGroupMemoryFence;
-  bool threadGroupExecutionFence;
-};
-
-enum class AtomicBinaryOp { And, Or, Xor, Add, IMax, IMin, UMax, UMin };
-
-struct InstAtomicBinOp {
-  AtomicBinaryOp op;
-  std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> dst;
-  SrcOperand dst_address;
-  SrcOperand src;          // select one component
-  DstOperand dst_original; // store single component, original value
-};
-
-struct InstAtomicImmIncrement {
-  DstOperand dst; // store single component, original value
-  AtomicDstOperandUAV uav;
-};
-
-struct InstAtomicImmDecrement {
-  DstOperand dst; // store single component, new value
-  AtomicDstOperandUAV uav;
-};
-
-struct InstAtomicImmExchange {
-  DstOperand dst; // store single component, original value
-  std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> dst_resource;
-  SrcOperand dst_address;
-  SrcOperand src; // select one component
-};
-
-struct InstAtomicImmCmpExchange {
-  DstOperand dst; // store single component, original value,
-  // note it's always written
-  std::variant<AtomicDstOperandUAV, AtomicOperandTGSM> dst_resource;
-  SrcOperand dst_address;
-  SrcOperand src0; // select one component
-  SrcOperand src1; // select one component
-};
-
-using Instruction = std::variant<
-  /* Generic */
-  InstMov, InstMovConditional, InstSwapConditional,                      //
-  InstDotProduct, InstSinCos,                                            //
-  InstConvert,                                                           //
-  InstIntegerCompare, InstFloatCompare,                                  //
-  InstFloatBinaryOp, InstIntegerBinaryOp, InstIntegerBinaryOpWithTwoDst, //
-  InstFloatUnaryOp, InstIntegerUnaryOp,                                  //
-  InstFloatMAD, InstIntegerMAD, InstMaskedSumOfAbsDiff,                  //
-  InstExtractBits, InstBitFiledInsert,                                   //
-  InstSample, InstSampleCompare, InstGather, InstGatherCompare,          //
-  InstSampleBias, InstSampleDerivative, InstSampleLOD,                   //
-  InstSamplePos, InstSampleInfo, InstBufferInfo, InstResourceInfo,       //
-  InstLoad, InstLoadUAVTyped, InstStoreUAVTyped,                         //
-  InstLoadRaw, InstLoadStructured, InstStoreRaw, InstStoreStructured,    //
-  InstNop,
-  /* Pixel Shader */
-  InstPixelDiscard, InstPartialDerivative, InstCalcLOD,
-  /* Atomics */
-  InstSync, InstAtomicBinOp,                       //
-  InstAtomicImmCmpExchange, InstAtomicImmExchange, //
-  InstAtomicImmIncrement, InstAtomicImmDecrement>;
-
-#pragma region shader reflection
 
 struct ResourceRange {
   uint32_t range_id;
@@ -741,52 +68,12 @@ struct ThreadgroupBufferInfo {
   bool structured;
 };
 
-#pragma endregion
-
-#pragma region basicblock
-
-class BasicBlock;
-
-struct BasicBlockCondition {
-  SrcOperand operand;
-  bool test_nonzero; //
+struct PhaseInfo {
+  uint32_t tempRegisterCount = 0;
+  std::unordered_map<
+    uint32_t, std::pair<uint32_t /* count */, uint32_t /* mask */>>
+    indexableTempRegisterCounts;
 };
-
-struct BasicBlockConditionalBranch {
-  BasicBlockCondition cond;
-  std::shared_ptr<BasicBlock> true_branch;
-  std::shared_ptr<BasicBlock> false_branch;
-};
-
-struct BasicBlockUnconditionalBranch {
-  std::shared_ptr<BasicBlock> target;
-};
-
-struct BasicBlockSwitch {
-  SrcOperand value;
-  std::map<uint32_t, std::shared_ptr<BasicBlock>> cases;
-  std::shared_ptr<BasicBlock> case_default;
-};
-
-struct BasicBlockReturn {};
-
-struct BasicBlockUndefined {};
-
-using BasicBlockTarget = std::variant<
-  BasicBlockConditionalBranch, BasicBlockUnconditionalBranch, BasicBlockSwitch,
-  BasicBlockReturn, BasicBlockUndefined>;
-
-class BasicBlock {
-public:
-  std::vector<Instruction> instructions;
-  BasicBlockTarget target;
-  std::string debug_name;
-
-  BasicBlock(const char *name)
-      : instructions(), target(BasicBlockUndefined{}), debug_name(name) {}
-};
-
-#pragma endregion
 
 class ShaderInfo {
 public:
@@ -805,6 +92,225 @@ public:
   bool skipOptimization = false;
   bool refactoringAllowed = true;
   bool use_cmp_exch = false;
+  bool no_control_point_phase_passthrough = false;
+  bool output_control_point_read = false;
+  std::vector<PhaseInfo> phases;
 };
 
+Instruction readInstruction(
+  const microsoft::D3D10ShaderBinary::CInstruction &Inst,
+  ShaderInfo &shader_info, uint32_t phase
+);
+
+using pvalue = dxmt::air::pvalue;
+using epvalue = llvm::Expected<pvalue>;
+using dxbc::Swizzle;
+using dxbc::swizzle_identity;
+
+struct context;
+using IRValue = ReaderIO<context, pvalue>;
+using IREffect = ReaderIO<context, std::monostate>;
+using IndexedIRValue = std::function<IRValue(pvalue)>;
+
+struct register_file {
+  llvm::Value *ptr_int4 = nullptr;
+  llvm::Value *ptr_float4 = nullptr;
+};
+
+struct indexable_register_file {
+  llvm::Value *ptr_int_vec = nullptr;
+  llvm::Value *ptr_float_vec = nullptr;
+  uint32_t vec_size = 0;
+};
+
+struct phase_temp {
+  register_file temp{};
+  std::unordered_map<uint32_t, indexable_register_file> indexable_temp_map{};
+};
+
+struct io_binding_map {
+  llvm::GlobalVariable *icb = nullptr;
+  llvm::Value *icb_float = nullptr;
+  std::unordered_map<uint32_t, IndexedIRValue> cb_range_map{};
+  std::unordered_map<uint32_t, IndexedIRValue> sampler_range_map{};
+  std::unordered_map<uint32_t, std::tuple<air::MSLTexture, IndexedIRValue>>
+    srv_range_map{};
+  std::unordered_map<
+    uint32_t, std::tuple<IndexedIRValue, IndexedIRValue, uint32_t>>
+    srv_buf_range_map{};
+  std::unordered_map<uint32_t, std::tuple<air::MSLTexture, IndexedIRValue>>
+    uav_range_map{};
+  std::unordered_map<
+    uint32_t, std::tuple<IndexedIRValue, IndexedIRValue, uint32_t>>
+    uav_buf_range_map{};
+  std::unordered_map<uint32_t, std::pair<uint32_t, llvm::GlobalVariable *>>
+    tgsm_map{};
+  std::unordered_map<uint32_t, IndexedIRValue> uav_counter_range_map{};
+
+  register_file input{};
+  register_file output{};
+  register_file temp{};
+  std::unordered_map<uint32_t, indexable_register_file> indexable_temp_map{};
+  std::vector<phase_temp> phases;
+  register_file patch_constant_output{};
+  uint32_t input_element_count = 0;
+  uint32_t output_element_count = 0;
+
+  // special registers (input)
+  llvm::Value *thread_id_arg = nullptr;
+  llvm::Value *thread_group_id_arg = nullptr;
+  llvm::Value *thread_id_in_group_arg = nullptr;
+  llvm::Value *thread_id_in_group_flat_arg = nullptr;
+  llvm::Value *coverage_mask_arg = nullptr;
+
+  llvm::Value *domain = nullptr;
+  llvm::Value *patch_id = nullptr;
+  llvm::Value *instanced_patch_id = nullptr;
+
+  llvm::Value *thread_id_in_patch = nullptr;
+
+  // special registers (output)
+  llvm::AllocaInst *depth_output_reg = nullptr;
+  llvm::AllocaInst *stencil_ref_reg = nullptr;
+  llvm::AllocaInst *coverage_mask_reg = nullptr;
+
+  llvm::AllocaInst *cmp_exch_temp = nullptr;
+
+  // special buffers for tessellation
+  llvm::Value *control_point_buffer;  // int4*
+  llvm::Value *patch_constant_buffer; // int*
+  llvm::Value *tess_factor_buffer;    // half*
+
+  // temp for fast look-up
+  llvm::Value *vertex_id = nullptr;
+  llvm::Value *vertex_id_with_base = nullptr;
+  llvm::Value *instance_id = nullptr;
+  llvm::Value *instance_id_with_base = nullptr;
+  llvm::Value *base_vertex_id = nullptr;
+  llvm::Value *base_instance_id = nullptr;
+  llvm::Value *vertex_buffer_table = nullptr;
+};
+
+struct context {
+  llvm::IRBuilder<> &builder;
+  llvm::LLVMContext &llvm;
+  llvm::Module &module;
+  llvm::Function *function;
+  io_binding_map &resource;
+  air::AirType &types; // hmmm
+  uint32_t pso_sample_mask;
+  microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
+};
+
+template <typename S> IRValue make_irvalue(S &&fs) {
+  return IRValue(std::forward<S>(fs));
+}
+
+template <typename S> IRValue make_irvalue_bind(S &&fs) {
+  return IRValue([fs = std::forward<S>(fs)](auto ctx) {
+    return fs(ctx).build(ctx);
+  });
+}
+
+template <typename S> IREffect make_effect(S &&fs) {
+  return IREffect(std::forward<S>(fs));
+}
+
+template <typename S> IREffect make_effect_bind(S &&fs) {
+  return IREffect([fs = std::forward<S>(fs)](auto ctx) mutable {
+    return fs(ctx).build(ctx);
+  });
+}
+
+IREffect store_at_vec4_array_masked(
+  llvm::Value *array, pvalue index, pvalue maybe_vec4, uint32_t mask
+);
+
+IREffect init_input_reg(
+  uint32_t with_fnarg_at, uint32_t to_reg, uint32_t mask,
+  bool fix_w_component = false
+);
+
+std::function<IRValue(pvalue)>
+pop_output_reg(uint32_t from_reg, uint32_t mask, uint32_t to_element);
+
+std::function<IRValue(pvalue)> pop_output_tess_factor(
+  uint32_t from_reg, uint32_t mask, uint32_t to_factor_indx, uint32_t factor_num
+);
+
+IREffect pull_vertex_input(
+  air::FunctionSignatureBuilder *func_signature, uint32_t to_reg, uint32_t mask,
+  SM50_IA_INPUT_ELEMENT element_info
+);
+
+llvm::Expected<llvm::BasicBlock *> convert_basicblocks(
+  std::shared_ptr<BasicBlock> entry, context &ctx, llvm::BasicBlock *return_bb
+);
+
+constexpr air::MSLScalerOrVectorType to_msl_type(RegisterComponentType type) {
+  switch (type) {
+  case RegisterComponentType::Unknown: {
+    assert(0 && "unknown component type");
+    break;
+  }
+  case RegisterComponentType::Uint:
+    return air::msl_uint4;
+  case RegisterComponentType::Int:
+    return air::msl_int4;
+  case RegisterComponentType::Float:
+    return air::msl_float4;
+    break;
+  }
+}
+
+struct ScalarInfo {
+  uint8_t component : 2;
+  uint8_t reg : 6;
+};
+
+class SM50ShaderInternal {
+public:
+  dxmt::dxbc::ShaderInfo shader_info;
+  dxmt::air::FunctionSignatureBuilder func_signature;
+  std::shared_ptr<dxmt::dxbc::BasicBlock> entry;
+  std::vector<std::function<
+    void(dxmt::dxbc::IREffect &, dxmt::air::FunctionSignatureBuilder *, SM50_SHADER_IA_INPUT_LAYOUT_DATA *)>>
+    input_prelogue_;
+  std::vector<std::function<void(dxmt::dxbc::IRValue &, dxmt::air::FunctionSignatureBuilder *,  bool)>> epilogue_;
+  microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE shader_type;
+  /* for domain shader, it refers to patch constant input count */
+  uint32_t max_input_register = 0;
+  uint32_t max_output_register = 0;
+  uint32_t max_patch_constant_output_register = 0;
+  std::vector<MTL_SM50_SHADER_ARGUMENT> args_reflection_cbuffer;
+  std::vector<MTL_SM50_SHADER_ARGUMENT> args_reflection;
+  uint32_t threadgroup_size[3] = {0};
+  uint32_t input_control_point_count = ~0u;
+  uint32_t output_control_point_count = ~0u;
+  uint32_t tessellation_partition = 0;
+  float max_tesselation_factor = 64.0f;
+  bool tessellation_anticlockwise = false;
+  std::vector<ScalarInfo> patch_constant_scalars;
+  uint32_t hull_maximum_threads_per_patch = 0;
+  std::vector<ScalarInfo> clip_distance_scalars;
+};
+
+llvm::Error convert_dxbc_hull_shader(
+  SM50ShaderInternal *pShaderInternal, const char *name,
+  SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,
+  llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+);
+
+llvm::Error convert_dxbc_domain_shader(
+  SM50ShaderInternal *pShaderInternal, const char *name,
+  SM50ShaderInternal *pHullStage, llvm::LLVMContext &context,
+  llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+);
+
+llvm::Error convert_dxbc_vertex_for_hull_shader(
+  const SM50ShaderInternal *pShaderInternal, const char *name,
+  const SM50ShaderInternal *pHullStage,
+  llvm::LLVMContext &context, llvm::Module &module,
+  SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+);
 } // namespace dxmt::dxbc
