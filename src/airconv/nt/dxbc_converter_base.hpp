@@ -32,6 +32,7 @@ struct TextureResourceHandle {
   llvm::Value *Handle;
   llvm::Value *Metadata;
   Swizzle Swizzle;
+  bool GlobalCoherent;
 };
 
 struct BufferResourceHandle {
@@ -229,7 +230,8 @@ public:
       if (SupportsNonExecutionBarrier())
         air.CreateAtomicFence(
             mem_flag,
-            sync.uav_boundary == InstSync::UAVBoundary::global ? ThreadScope::Device : ThreadScope::Threadgroup
+            (sync.uav_boundary == InstSync::UAVBoundary::global ? (ThreadScope::Device | ThreadScope::Threadgroup)
+                                                                : ThreadScope::Threadgroup)
         );
       if (sync.tgsm_execution_barrier)
         air.CreateBarrier(SupportsNonExecutionBarrier() ? MemFlags::None : mem_flag);
