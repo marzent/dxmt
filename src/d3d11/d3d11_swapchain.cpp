@@ -67,13 +67,13 @@ template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
 public:
   MTLD3D11SwapChain(
-      IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pLayerFactoryWeakref,
+      IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pDXGIDevice,
        HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc
   ) :
       MTLDXGISubObject(pDevice),
       factory_(pFactory),
-      layer_factory_weak_(pLayerFactoryWeakref),
+      dxgi_device_(pDXGIDevice),
       presentation_count_(0),
       desc_(*pDesc),
       device_context_(pDevice->GetImmediateContextPrivate()),
@@ -94,7 +94,7 @@ public:
 
     presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
                                  pDevice->GetDXMTDevice().queue().cmd_library,
-                                 scale_factor));
+                                 scale_factor, desc_.SampleDesc.Count));
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
@@ -140,8 +140,9 @@ public:
       .MiscFlags = {},
       .TextureLayout = {},
     };
-    // if (desc_.BufferUsage & DXGI_USAGE_SHADER_INPUT)
-    backbuffer_desc_.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    
+    if (desc_.BufferUsage & DXGI_USAGE_SHADER_INPUT)
+      backbuffer_desc_.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
     if (desc_.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS)
       backbuffer_desc_.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
@@ -433,8 +434,9 @@ public:
                               : colorspace_,
                           LayerSupportEDR());
     if (presenter->changeLayerProperties(
-        ConvertSwapChainFormat(desc_.Format), target_color_space,
-        desc_.Width * scale_factor, desc_.Height * scale_factor))
+            ConvertSwapChainFormat(desc_.Format), target_color_space, desc_.Width * scale_factor,
+            desc_.Height * scale_factor, desc_.SampleDesc.Count
+        ))
       device_context_->WaitUntilGPUIdle();
   };
 
@@ -447,7 +449,7 @@ public:
     Com<IDXGIAdapter> adapter;
     Com<IDXGIOutput> output;
 
-    if (FAILED(layer_factory_weak_->GetAdapter(&adapter)))
+    if (FAILED(dxgi_device_->GetAdapter(&adapter)))
       return E_FAIL;
 
     for (uint32_t i = 0; SUCCEEDED(adapter->EnumOutputs(i, &output)); i++) {
@@ -855,7 +857,7 @@ private:
   };
 
   Com<IDXGIFactory1> factory_;
-  IMTLDXGIDevice *layer_factory_weak_;
+  Com<IMTLDXGIDevice> dxgi_device_;
   WMT::Object native_view_;
   WMT::MetalLayer layer_weak_;
   ULONG presentation_count_;

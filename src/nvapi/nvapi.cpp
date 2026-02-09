@@ -70,7 +70,7 @@ NvAPI_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERS
 
 NVAPI_INTERFACE
 NvAPI_GetInterfaceVersionString(NvAPI_ShortString szDesc) {
-  std::string version_str = std::format("NVAPI Open Source Interface (DXMT-NVAPI)");
+  std::string version_str = "NVAPI Open Source Interface (DXMT-NVAPI)";
 
   if (!szDesc)
     return NVAPI_INVALID_ARGUMENT;
@@ -88,7 +88,6 @@ NvAPI_D3D_GetCurrentSLIState(IUnknown *pDevice,
 
   switch (pSliState->version) {
   case NV_GET_CURRENT_SLI_STATE_VER1:
-
     pSliState->maxNumAFRGroups = 1;
     pSliState->numAFRGroups = 1;
     pSliState->currentAFRIndex = 0;
@@ -482,6 +481,101 @@ NvAPI_GPU_GetConnectedDisplayIds(
 }
 
 NVAPI_INTERFACE
+NvAPI_DISP_GetMonitorCapabilities(__in NvU32 displayId, __inout NV_MONITOR_CAPABILITIES *pMonitorCapabilities) {
+  if (!pMonitorCapabilities)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetAllClockFrequencies(__in NvPhysicalGpuHandle hPhysicalGPU,
+                                 __inout NV_GPU_CLOCK_FREQUENCIES *pClkFreqs) {
+  if (!pClkFreqs)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetArchInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_ARCH_INFO *pGpuArchInfo) {
+  if (!hPhysicalGpu || !pGpuArchInfo)
+    return NVAPI_INVALID_ARGUMENT;
+
+  // NVIDIA GeForce RTX 4090
+  switch (pGpuArchInfo->version) {
+    case NV_GPU_ARCH_INFO_VER_1: {
+      auto pGpuArchInfoV1 = (NV_GPU_ARCH_INFO_V1 *)(pGpuArchInfo);
+      pGpuArchInfoV1->architecture = NV_GPU_ARCHITECTURE_AD100;
+      pGpuArchInfoV1->implementation = NV_GPU_ARCH_IMPLEMENTATION_AD102;
+      pGpuArchInfoV1->revision = NV_GPU_CHIP_REV_UNKNOWN;
+      break;
+    }
+    case NV_GPU_ARCH_INFO_VER_2:
+      pGpuArchInfo->architecture_id = NV_GPU_ARCHITECTURE_AD100;
+      pGpuArchInfo->implementation_id = NV_GPU_ARCH_IMPLEMENTATION_AD102;
+      pGpuArchInfo->revision_id = NV_GPU_CHIP_REV_UNKNOWN;
+      break;
+    default:
+      return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  }
+
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetGpuCoreCount(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pCount) {
+  if (!hPhysicalGpu || !pCount)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetBusId(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pBusId) {
+  if (!hPhysicalGpu || !pBusId)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetBusType(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_BUS_TYPE *pBusType) {
+  if (!hPhysicalGpu || !pBusType)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetMemoryInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_DISPLAY_DRIVER_MEMORY_INFO *pMemoryInfo) {
+  if (!hPhysicalGpu || !pMemoryInfo)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetMemoryInfoEx(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_MEMORY_INFO_EX *pMemoryInfo) {
+  if (!hPhysicalGpu || !pMemoryInfo)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName) {
+  std::string adapter_str = "NVIDIA GeForce RTX 4090";
+
+  if (!szName)
+    return NVAPI_INVALID_ARGUMENT;
+
+  memcpy(szName, adapter_str.c_str(), adapter_str.size());
+
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
 NvAPI_DISP_GetGDIPrimaryDisplayId(NvU32 *displayId) {
   if (!displayId)
     return NVAPI_INVALID_ARGUMENT;
@@ -589,6 +683,19 @@ NvAPI_Stereo_SetDriverMode(NV_STEREO_DRIVER_MODE mode) {
   return NVAPI_STEREO_NOT_INITIALIZED;
 }
 
+NVAPI_INTERFACE
+NvAPI_DRS_CreateSession(NvDRSSessionHandle *phSession) {
+  if (!phSession)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NOT_SUPPORTED;
+}
+
+NVAPI_INTERFACE
+NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
+  return NVAPI_NOT_SUPPORTED;
+}
+
 extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   switch (id) {
   case 0x0150e828:
@@ -641,12 +748,32 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_Disp_HdrColorControl;
   case 0x84f2a8df:
     return (void *)&NvAPI_Disp_GetHdrCapabilities;
+  case 0x3b05c7e1:
+    return (void *)&NvAPI_DISP_GetMonitorCapabilities;
   case 0x9abdd40d:
     return (void *)&NvAPI_EnumNvidiaDisplayHandle;
   case 0x0078dba2:
     return (void *)&NvAPI_GPU_GetConnectedDisplayIds;
   case 0x1e9d8a31:
     return (void *)&NvAPI_DISP_GetGDIPrimaryDisplayId;
+  case 0xd8265d24:
+    return (void *)&NvAPI_GPU_GetArchInfo;
+  case 0xdcb616c3:
+    return (void *)&NvAPI_GPU_GetAllClockFrequencies;
+  case 0xc7026a87:
+    return (void *)&NvAPI_GPU_GetGpuCoreCount;
+  case 0x1be0b8e5:
+    return (void *)&NvAPI_GPU_GetBusId;
+  case 0x1bb18724:
+    return (void *)&NvAPI_GPU_GetBusType;
+  case 0x07f9b368:
+    return (void *)&NvAPI_GPU_GetMemoryInfo;
+  case 0xc0599498:
+    return (void *)&NvAPI_GPU_GetMemoryInfoEx;
+  case 0xceee8e9f:
+    return (void *)&NvAPI_GPU_GetFullName;
+  case 0x6ff81213:
+    return (void *)&NvAPI_GPU_GetPstates20;
   case 0xaef96ca1:
     return (void *)&NvAPI_D3D_GetSleepStatus;
   case 0xac1ca9e0:
@@ -657,14 +784,16 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_D3D_Sleep;
   case 0x1a587f9c:
     return (void *)&NvAPI_D3D_GetLatency;
-  case 0x6ff81213:
-    return (void *)&NvAPI_GPU_GetPstates20;
   case 0xdc6dc8d3:
     return (void *)&NvAPI_Mosaic_GetDisplayViewportsByResolution;
   case 0x348ff8e1:
     return (void *)&NvAPI_Stereo_IsEnabled;
   case 0x5e8f0bec:
     return (void *)&NvAPI_Stereo_SetDriverMode;
+  case 0x0694d52e:
+    return (void *)&NvAPI_DRS_CreateSession;
+  case 0x375dbd6b:
+    return (void *)&NvAPI_DRS_LoadSettings;
   default:
     break;
   }

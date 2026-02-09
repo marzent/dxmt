@@ -95,7 +95,7 @@ public:
   air::ArgumentBufferBuilder binding_table_cbuffer;
   air::ArgumentBufferBuilder binding_table;
   bool skipOptimization = false;
-  bool refactoringAllowed = true;
+  bool refactoringAllowed = false;
   bool use_cmp_exch = false;
   bool no_control_point_phase_passthrough = false;
   bool output_control_point_read = false;
@@ -466,8 +466,6 @@ void setup_binding_table(
   uint32_t argbuffer_constant_slot = kConstantBufferBindIndex, 
   uint32_t argbuffer_slot = kArgumentBufferBindIndex
 );
-
-void setup_fastmath_flag(llvm::Module &module, llvm::IRBuilder<> &builder);
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_verison);
 

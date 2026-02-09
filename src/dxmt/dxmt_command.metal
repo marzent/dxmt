@@ -164,7 +164,7 @@ struct DXMTClearTextureBufferFloat {
 [[kernel]] void clear_texture_buffer_float(
     texture_buffer<float, access::read_write> tex [[texture(0)]],
     constant DXMTClearTextureBufferFloat& args [[buffer(1)]],
-    ushort pos [[thread_position_in_grid]]
+    uint pos [[thread_position_in_grid]]
 ) {
   uint width = tex.get_width();
   uint offset = pos + args.offset;
@@ -279,11 +279,14 @@ constexpr constant uint kPresentFCIndex_BackbufferSizeMatched = 0x100;
 constexpr constant uint kPresentFCIndex_BackbufferIsSRGB = 0x103;
 constexpr constant uint kPresentFCIndex_HDRPQ = 0x101;
 constexpr constant uint kPresentFCIndex_WithHDRMetadata = 0x102;
+constexpr constant uint kPresentFCIndex_BackbufferIsMS = 0x104;
 
 constant bool present_backbuffer_size_matched [[function_constant(kPresentFCIndex_BackbufferSizeMatched)]];
 constant bool present_backbuffer_is_srgb [[function_constant(kPresentFCIndex_BackbufferIsSRGB)]];
 constant bool present_hdr_pq [[function_constant(kPresentFCIndex_HDRPQ)]];
 constant bool present_with_hdr_metadata [[function_constant(kPresentFCIndex_WithHDRMetadata)]];
+constant bool present_backbuffer_is_ms [[function_constant(kPresentFCIndex_BackbufferIsMS)]];
+constant bool present_backbuffer_is_not_ms = !present_backbuffer_is_ms;
 
 constexpr sampler s(coord::normalized);
 
@@ -299,12 +302,22 @@ float3 to_srgb(float3 linear) {
 
 [[fragment]] float4 fs_present_quad(
     present_data input [[stage_in]],
-    texture2d<float, access::sample> source [[texture(0)]],
+    texture2d<float, access::sample> source [[texture(0), function_constant(present_backbuffer_is_not_ms)]],
+    texture2d_ms<float, access::read> source_ms [[texture(0), function_constant(present_backbuffer_is_ms)]],
     constant DXMTPresentMetadata& meta [[buffer(0)]]
 ) {
-  float4 output = present_backbuffer_size_matched
+  float4 output = float4(0);
+  if (present_backbuffer_is_ms) {
+    const uint count = source_ms.get_num_samples();
+    for (uint i = 0; i < count; i++) {
+      output += source_ms.read(uint2(input.position.xy), i);
+    }
+    output /= count;
+  } else {
+    output = present_backbuffer_size_matched
       ? source.read(uint2(input.position.xy))
       : source.sample(s, input.uv);
+  }
   float3 output_rgb = output.xyz;
   float edr_scale = meta.edr_scale;
   if (present_backbuffer_is_srgb)
@@ -536,7 +549,7 @@ struct DXMTClearUintMetadata {
   tex.write(meta.value, meta.offset + pos.xy, pos.z);
 }
 
-[[kernel]] void cs_clear_texture_buffer_float(
+[[kernel]] void cs_clear_tbuffer_float(
     texture_buffer<float, access::write> tex [[texture(0)]],
     constant DXMTClearFloatMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]
@@ -544,7 +557,7 @@ struct DXMTClearUintMetadata {
   tex.write(meta.value, meta.offset.x + pos);
 }
 
-[[kernel]] void cs_clear_texture_buffer_uint(
+[[kernel]] void cs_clear_tbuffer_uint(
     texture_buffer<uint, access::write> tex [[texture(0)]],
     constant DXMTClearUintMetadata& meta [[buffer(1)]],
     uint pos [[thread_position_in_grid]]

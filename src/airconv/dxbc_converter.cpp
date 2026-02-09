@@ -323,11 +323,11 @@ void setup_temp_register(
   air::AirType &types, llvm::Module &module, llvm::IRBuilder<> &builder
 ) {
   resource_map.temp.ptr_int4 = builder.CreateAlloca(
-    llvm::ArrayType::get(types._int4, shader_info->tempRegisterCount)
+    llvm::ArrayType::get(types._int, 4 * shader_info->tempRegisterCount)
   );
   resource_map.temp.ptr_float4 = builder.CreateBitCast(
     resource_map.temp.ptr_int4,
-    llvm::ArrayType::get(types._float4, shader_info->tempRegisterCount)
+    llvm::ArrayType::get(types._float, 4 * shader_info->tempRegisterCount)
       ->getPointerTo()
   );
   for (auto &phase : shader_info->phases) {
@@ -335,11 +335,11 @@ void setup_temp_register(
     auto &phase_temp = resource_map.phases.back();
 
     phase_temp.temp.ptr_int4 = builder.CreateAlloca(
-      llvm::ArrayType::get(types._int4, phase.tempRegisterCount)
+      llvm::ArrayType::get(types._int, 4 * phase.tempRegisterCount)
     );
     phase_temp.temp.ptr_float4 = builder.CreateBitCast(
       phase_temp.temp.ptr_int4,
-      llvm::ArrayType::get(types._float4, phase.tempRegisterCount)
+      llvm::ArrayType::get(types._float, 4 * phase.tempRegisterCount)
         ->getPointerTo()
     );
 
@@ -370,27 +370,6 @@ void setup_temp_register(
     resource_map.cmp_exch_temp = builder.CreateAlloca(types._int);
   }
 }
-
-void setup_fastmath_flag(llvm::Module &module, llvm::IRBuilder<> &builder) {
-  if (auto options = module.getNamedMetadata("air.compile_options")) {
-    for (auto operand : options->operands()) {
-      if (isa<llvm::MDTuple>(operand) && cast<llvm::MDTuple>(operand)->getNumOperands() == 1 &&
-          isa<llvm::MDString>(cast<llvm::MDTuple>(operand)->getOperand(0)) &&
-          cast<llvm::MDString>(cast<llvm::MDTuple>(operand)->getOperand(0))
-                  ->getString()
-                  .compare("air.compile.fast_math_enable") == 0) {
-        builder.getFastMathFlags().setNoInfs();
-        builder.getFastMathFlags().setNoNaNs();
-        builder.getFastMathFlags().setNoSignedZeros();
-        builder.getFastMathFlags().setAllowReassoc();
-        builder.getFastMathFlags().setAllowReciprocal();
-        // builder.getFastMathFlags().setAllowContract();
-        builder.getFastMathFlags().setApproxFunc();
-      }
-    }
-  }
-}
-
 
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_verison) {
   using namespace llvm;
@@ -503,7 +482,6 @@ llvm::Error convert_dxbc_pixel_shader(
   llvm::air::AIRBuilder air(builder, nulldbg);
 
   setup_metal_version(module, metal_version);
-  setup_fastmath_flag(module, builder);
 
   resource_map.input.ptr_int4 =
     builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
@@ -609,7 +587,6 @@ llvm::Error convert_dxbc_compute_shader(
   llvm::air::AIRBuilder air(builder, nulldbg);
 
   setup_metal_version(module, metal_version);
-  setup_fastmath_flag(module, builder);
   setup_temp_register(shader_info, resource_map, types, module, builder);
   setup_immediate_constant_buffer(
     shader_info, resource_map, types, module, builder
@@ -785,7 +762,6 @@ llvm::Error convert_dxbc_vertex_shader(
   llvm::air::AIRBuilder air(builder, nulldbg);
 
   setup_metal_version(module, metal_version);
-  setup_fastmath_flag(module, builder);
 
   resource_map.vertex_id_with_base = function->getArg(vertex_idx);
   resource_map.base_vertex_id = function->getArg(base_vertex_idx);
@@ -1405,18 +1381,9 @@ AIRCONV_API int SM50Compile(
   context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
 
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_info;
-  auto shader_type = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->shader_type;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(
-    *pModule,
-    {.enableFastMath =
-       (!shader_info.skipOptimization && shader_info.refactoringAllowed &&
-        // this is by design: vertex functions are usually not the
-        // bottle-neck of pipeline, and precise calculation on pixel can reduce
-        // flickering
-        shader_type != microsoft::D3D10_SB_VERTEX_SHADER)}
-  );
+  initializeModule(*pModule);
 
   if (auto err = dxmt::dxbc::convertDXBC(
         pShader, FunctionName, context, *pModule, pArgs
@@ -1478,11 +1445,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     ((dxmt::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(
-    *pModule,
-    {.enableFastMath =
-       (!shader_info.skipOptimization && shader_info.refactoringAllowed)}
-  );
+  initializeModule(*pModule);
 
   if (auto err = dxmt::dxbc::convert_dxbc_vertex_hull_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, (dxbc::SM50ShaderInternal *)pHullShader, 
@@ -1544,19 +1507,9 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 
   auto &shader_info =
     ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
-  auto shader_type =
-    ((dxmt::dxbc::SM50ShaderInternal *)pDomainShader)->shader_type;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(
-    *pModule,
-    {.enableFastMath =
-       (!shader_info.skipOptimization && shader_info.refactoringAllowed &&
-        // this is by design: vertex functions are usually not the
-        // bottle-neck of pipeline, and precise calculation on pixel can reduce
-        // flickering
-        shader_type != microsoft::D3D10_SB_VERTEX_SHADER)}
-  );
+  initializeModule(*pModule);
 
   if (auto err = dxmt::dxbc::convert_dxbc_tesselator_domain_shader(
         (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
@@ -1620,7 +1573,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   auto &shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(*pModule, {.enableFastMath = false});
+  initializeModule(*pModule);
 
   if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
         (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
@@ -1684,11 +1637,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     ((dxmt::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
   auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(
-    *pModule,
-    {.enableFastMath =
-       (!shader_info.skipOptimization && shader_info.refactoringAllowed)}
-  );
+  initializeModule(*pModule);
 
   if (auto err = dxmt::dxbc::convert_dxbc_geometry_shader(
         (dxbc::SM50ShaderInternal *)pGeometryShader, FunctionName,

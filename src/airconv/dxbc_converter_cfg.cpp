@@ -103,10 +103,6 @@ read_control_flow(
     D3D10ShaderBinary::CInstruction Inst;
     Parser.ParseInstruction(&Inst);
 
-    // HACK: mark all instructions as precise if refactor is not allowed
-    if (!shader_info.refactoringAllowed)
-      Inst.SetPreciseMask(0b1111);
-
     switch (Inst.OpCode()) {
 
     case D3D10_SB_OPCODE_IF: {
@@ -546,8 +542,8 @@ read_control_flow(
       if (Inst.m_GlobalFlagsDecl.Flags & D3D11_1_SB_GLOBAL_FLAG_SKIP_OPTIMIZATION) {
         shader_info.skipOptimization = true;
       }
-      if ((Inst.m_GlobalFlagsDecl.Flags & D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED) == 0) {
-        shader_info.refactoringAllowed = false;
+      if (Inst.m_GlobalFlagsDecl.Flags & D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED) {
+        shader_info.refactoringAllowed = true;
       }
       break;
     }
@@ -665,7 +661,8 @@ read_control_flow(
     // if fork/join phase reads control point phase output, or control point phase is absent
     // then we need to perform a memcpy from threadgroup memory to payload memory
     // otherwise output is written to payload memory directly
-    if (shader_info.output_control_point_read || !shader_info.no_control_point_phase_passthrough) {
+    if (sm50_shader->shader_type == microsoft::D3D11_SB_HULL_SHADER &&
+        (shader_info.output_control_point_read || !shader_info.no_control_point_phase_passthrough)) {
       bb_current->target = BasicBlockHullShaderWriteOutput{sm50_shader->output_control_point_count, bb_return};
     } else {
       bb_current->target = BasicBlockUnconditionalBranch{bb_return};

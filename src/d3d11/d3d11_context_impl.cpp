@@ -991,7 +991,6 @@ public:
             format = format_desc.PixelFormat](ArgumentEncodingContext &enc) mutable {
       TextureViewDescriptor src_desc;
       src_desc.format = format;
-      src_desc.usage = WMTTextureUsageRenderTarget;
       src_desc.type = src->textureType();
       src_desc.arraySize = 1;
       src_desc.firstArraySlice = SrcSubresource; // src must be a MS(Array) texture which has exactly 1 mipmap level
@@ -1000,7 +999,6 @@ public:
 
       TextureViewDescriptor dst_desc;
       dst_desc.format = format;
-      dst_desc.usage = WMTTextureUsageRenderTarget;
       dst_desc.type = WMTTextureType2D;
       dst_desc.arraySize = 1;
       dst_desc.firstArraySlice = dst_slice;
@@ -4312,7 +4310,10 @@ public:
         (state_.OutputMerger.DepthStencilState ? state_.OutputMerger.DepthStencilState : default_depth_stencil_state)
             ->IsEnabled();
     // FIXME: corner case: DSV is not bound or missing planar
-    Desc.RasterizationEnabled = PS || ds_enabled;
+    Desc.RasterizationEnabled =
+        (PS || ds_enabled) && (!Desc.SOLayout || Desc.SOLayout->RasterizedStream() != D3D11_SO_NO_RASTERIZED_STREAM);
+    if (!Desc.RasterizationEnabled)
+      Desc.PixelShader = nullptr; // Even rasterization is disabled, Metal still checks if VS-PS signatures match.
     Desc.SampleMask = state_.OutputMerger.SampleMask;
     Desc.GSPassthrough = GS ? GS->reflection().GeometryShader.GSPassThrough : ~0u;
     if (unlikely(Desc.GSPassthrough == ~0u && Desc.GeometryShader != nullptr)) {
@@ -4666,7 +4667,7 @@ public:
 
   void
   UpdateSOTargets() {
-    if (state_.ShaderStages[PipelineStage::Pixel].Shader) {
+    if (!state_.ShaderStages[PipelineStage::Geometry].Shader) {
       return;
     }
     /**
@@ -4900,6 +4901,12 @@ public:
     case WMTPixelFormatRG32Float:
     case WMTPixelFormatRG32Sint:
       return WMTPixelFormatRG32Float;
+    case WMTPixelFormatRGBA16Sint:
+    case WMTPixelFormatRGBA16Snorm:
+    case WMTPixelFormatRGBA16Uint:
+    case WMTPixelFormatRGBA16Unorm:
+    case WMTPixelFormatRGBA16Float:
+      return WMTPixelFormatRGBA16Float;
     default:
       break;
     }
@@ -5016,7 +5023,6 @@ public:
       auto mv_view = motion_vector->createView(
           {.format = motion_vector_format,
            .type = WMTTextureType2D,
-           .usage = motion_vector->usage(),
            .firstMiplevel = 0,
            .miplevelCount = 1,
            .firstArraySlice = 0,

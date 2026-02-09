@@ -273,6 +273,7 @@ DepthStencilBlitContext::DepthStencilBlitContext(
   WMT::InitializeRenderPipelineInfo(pipeline_info);
   pipeline_info.vertex_function = vs_copy;
   pipeline_info.depth_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+  pipeline_info.stencil_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
   pipeline_info.rasterization_enabled = true;
   pipeline_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
 
@@ -333,7 +334,6 @@ DepthStencilBlitContext::copyFromBuffer(
     return;
   }
   view_desc.format = depth_stencil->pixelFormat();
-  view_desc.usage = depth_stencil->usage();
   view_desc.firstMiplevel = level;
   view_desc.miplevelCount = 1;
   view_desc.firstArraySlice = slice;
@@ -422,16 +422,14 @@ DepthStencilBlitContext::copyFromTexture(
   default:
     return;
   }
-  view_desc.format = depth_stencil->pixelFormat();
-  view_desc.usage = WMTTextureUsageShaderRead;
+  view_desc.format = WMTPixelFormatDepth32Float_Stencil8;
   view_desc.firstMiplevel = level;
   view_desc.miplevelCount = 1;
   view_desc.firstArraySlice = slice;
   view_desc.arraySize = 1;
   auto depth_view = depth_stencil->createView(view_desc);
 
-  view_desc.format = depth_stencil->pixelFormat() == WMTPixelFormatDepth24Unorm_Stencil8 ? WMTPixelFormatX24_Stencil8
-                                                                                         : WMTPixelFormatX32_Stencil8;
+  view_desc.format = WMTPixelFormatX32_Stencil8;
   auto stencil_view = depth_stencil->createView(view_desc);
 
   ctx_.startComputePass(0);

@@ -319,16 +319,17 @@ public:
     trunc,
     cos,
     sin,
+    fabs,
   };
 
-  Value *CreateFPUnOp(FPUnOp Op, Value *Operand);
+  Value *CreateFPUnOp(FPUnOp Op, Value *Operand, bool FastVariant = true);
 
   enum FPBinOp {
     fmax,
     fmin,
   };
 
-  Value *CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS);
+  Value *CreateFPBinOp(FPBinOp Op, Value *LHS, Value *RHS, bool FastVariant = true);
 
   enum IntUnOp {
     reverse_bits,
