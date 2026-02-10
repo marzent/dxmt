@@ -76,8 +76,6 @@ FormatCapabilityInspector::Inspect(WMT::Device device) {
     APPEND_CAP(WMTPixelFormatRGBA8Sint, APPLE_INT_FORMAT_CAP | TEXTURE_BUFFER_ALL_CAP)
     APPEND_CAP(WMTPixelFormatBGRA8Unorm, ALL_CAP | FormatCapability::TextureBufferRead)
     APPEND_CAP(WMTPixelFormatBGRA8Unorm_sRGB, ALL_CAP)
-    APPEND_CAP(WMTPixelFormatBGRX8Unorm, ALL_CAP | FormatCapability::TextureBufferRead)
-    APPEND_CAP(WMTPixelFormatBGRX8Unorm_sRGB, ALL_CAP)
 
     // 32-bit packed
     APPEND_CAP(WMTPixelFormatRGB10A2Unorm, ALL_CAP | TEXTURE_BUFFER_READ_OR_WRITE)
@@ -219,11 +217,6 @@ FormatCapabilityInspector::Inspect(WMT::Device device) {
     APPEND_CAP(WMTPixelFormatBGRA8Unorm, ALL_CAP | FormatCapability::TextureBufferRead)
     APPEND_CAP(
         WMTPixelFormatBGRA8Unorm_sRGB, FormatCapability::Filter | FormatCapability::Color | FormatCapability::MSAA |
-                                             FormatCapability::Resolve | FormatCapability::Blend
-    )
-    APPEND_CAP(WMTPixelFormatBGRX8Unorm, ALL_CAP | FormatCapability::TextureBufferRead)
-    APPEND_CAP(
-        WMTPixelFormatBGRX8Unorm_sRGB, FormatCapability::Filter | FormatCapability::Color | FormatCapability::MSAA |
                                              FormatCapability::Resolve | FormatCapability::Blend
     )
 
@@ -1035,7 +1028,7 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     break;
   }
   case DXGI_FORMAT_B4G4R4A4_UNORM:  {
-    description.PixelFormat = WMTPixelFormatARGB4Unorm;
+    description.PixelFormat = WMTPixelFormatBGRA4Unorm;
     description.BytesPerTexel = 2;
     break;
   }
@@ -1068,7 +1061,7 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
 
 uint32_t
 MTLGetTexelSize(WMTPixelFormat format) {
-  switch (format) {
+  switch (ORIGINAL_FORMAT(format)) {
   case WMTPixelFormatInvalid:
     return 0;
   case WMTPixelFormatA8Unorm:
@@ -1108,8 +1101,6 @@ MTLGetTexelSize(WMTPixelFormat format) {
   case WMTPixelFormatRGBA8Sint:
   case WMTPixelFormatBGRA8Unorm:
   case WMTPixelFormatBGRA8Unorm_sRGB:
-  case WMTPixelFormatBGRX8Unorm:
-  case WMTPixelFormatBGRX8Unorm_sRGB:
   case WMTPixelFormatRGB10A2Unorm:
   case WMTPixelFormatRGB10A2Uint:
   case WMTPixelFormatRG11B10Float:
