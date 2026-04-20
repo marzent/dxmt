@@ -1,4 +1,4 @@
-#ifndef DXMT_NATIVE
+#ifdef _WIN32
 #define WINEMETAL_API __declspec(dllexport)
 #else
 #define WINEMETAL_API
@@ -1117,4 +1117,65 @@ MTLSharedEvent_waitUntilSignaledValue(obj_handle_t event, uint64_t value, uint64
   params.ret_timeout = 0;
   UNIX_CALL(126, &params);
   return params.ret_timeout;
+}
+
+WINEMETAL_API obj_handle_t
+MTLCounterSampleBuffer_newTimestampBuffer(obj_handle_t device, uint32_t sample_count, bool shared) {
+  struct unixcall_mtlcountersamplebuffer_newtimestampbuffer params;
+  params.device = device;
+  params.sample_count = sample_count;
+  params.shared = shared;
+  params.ret = 0;
+  UNIX_CALL(127, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCounterSampleBuffer_resolveCounterRange(
+    obj_handle_t sample_buffer, uint32_t start, uint32_t len, void *data_out, uint64_t data_length
+) {
+  struct unixcall_mtlcountersamplebuffer_resolvecounterrange params;
+  params.sample_buffer = sample_buffer;
+  params.start = start;
+  params.len = len;
+  params.data_length = data_length;
+  WMT_MEMPTR_SET(params.data_out, data_out);
+  UNIX_CALL(128, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(
+    obj_handle_t cmdbuf, struct WMTSampleBufferAttachmentInfo *sample_buffer_attachments,
+    uint64_t num_sample_buffer_attachments) {
+  struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers params;
+  params.cmdbuf = cmdbuf;
+  WMT_MEMPTR_SET(params.attachments, sample_buffer_attachments);
+  params.num_attachments = num_sample_buffer_attachments;
+  params.ret = 0;
+  UNIX_CALL(129, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLCommandBuffer_property(obj_handle_t cmdbuf, enum WMTCommandBufferProperty prop) {
+  struct unixcall_generic_obj_uint64_uint64_ret params;
+  params.handle = cmdbuf;
+  params.arg = prop;
+  UNIX_CALL(130, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newTileRenderPipelineState(
+    obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newrenderpso params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  UNIX_CALL(131, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_pso;
 }

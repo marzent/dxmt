@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unknwn.h>
 
@@ -180,6 +181,37 @@ private:
 };
 
 /**
+ * \brief SRW-based shared mutex implementation
+ */
+class shared_mutex {
+
+public:
+  using native_handle_type = PSRWLOCK;
+
+  shared_mutex() {}
+
+  shared_mutex(const shared_mutex &) = delete;
+  shared_mutex &operator=(const shared_mutex &) = delete;
+
+  void lock() { AcquireSRWLockExclusive(&m_lock); }
+
+  void lock_shared() { AcquireSRWLockShared(&m_lock); }
+
+  void unlock() { ReleaseSRWLockExclusive(&m_lock); }
+
+  void unlock_shared() { ReleaseSRWLockShared(&m_lock); }
+
+  bool try_lock() { return TryAcquireSRWLockExclusive(&m_lock); }
+
+  bool try_lock_shared() { return TryAcquireSRWLockShared(&m_lock); }
+
+  native_handle_type native_handle() { return &m_lock; }
+
+private:
+  SRWLOCK m_lock = SRWLOCK_INIT;
+};
+
+/**
  * \brief Recursive mutex implementation
  *
  * Drop-in replacement for \c std::recursive_mutex that
@@ -304,7 +336,7 @@ public:
       policy = SCHED_OTHER;
       break;
     case ThreadPriority::Lowest:
-#ifdef DXMT_NATIVE
+#ifdef __APPLE__
       policy = SCHED_FIFO; /* No SCHED_IDLE on macOS */
 #else
       policy = SCHED_IDLE;
@@ -316,6 +348,7 @@ public:
 };
 
 using mutex = std::mutex;
+using shared_mutex = std::shared_mutex;
 using recursive_mutex = std::recursive_mutex;
 using condition_variable = std::condition_variable;
 

@@ -115,7 +115,7 @@ void handle_signature_vs(
       if (sig.mask() == 0) break;
       signature_handlers.push_back(
         [=, type = (InputAttributeComponentType)sig.componentType(),
-         name = sig.fullSemanticString()](SignatureContext &ctx) {
+         name = sig.consistentAttributeName()](SignatureContext &ctx) {
           if (ctx.ia_layout) {
             for (unsigned i = 0; i < ctx.ia_layout->num_elements; i++) {
               if (ctx.ia_layout->elements[i].reg == reg) {
@@ -167,9 +167,26 @@ void handle_signature_vs(
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
-    case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+    case D3D10_SB_NAME_CULL_DISTANCE: {
+      for (unsigned i = 0; i < 4; i++) {
+        if (mask & (1 << i)) {
+          sm50_shader->cull_distance_scalars.push_back(
+            {.component = (uint8_t)(i), .reg = (uint8_t)reg}
+          );
+        }
+      }
+      uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
+        .user = std::format("SV_CullDistance{}", reg),
+        .type = msl_float4,
+      });
+      signature_handlers.push_back([=](SignatureContext &ctx) {
+        if (ctx.skip_vertex_output)
+          return;
+        ctx.epilogue >> pop_output_reg(reg, mask, assigned_index);
+      });
+      max_output_register = std::max(reg + 1, max_output_register);
       break;
+    }
     case D3D10_SB_NAME_POSITION: {
       auto assigned_index =
         func_signature.DefineOutput(OutputPosition{.type = msl_float4});
@@ -220,7 +237,7 @@ void handle_signature_vs(
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
-        .user = sig.fullSemanticString(),
+        .user = sig.consistentAttributeName(),
         .type = to_msl_type(sig.componentType()),
       });
       signature_handlers.push_back([=](SignatureContext &ctx) {
@@ -344,6 +361,14 @@ void handle_signature_ps(
         .pull_mode = false
       });
       break;
+    case D3D10_SB_NAME_CULL_DISTANCE:
+      assigned_index = func_signature.DefineInput(InputFragmentStageIn{
+        .user = std::format("SV_CullDistance{}", reg),
+        .type = msl_float4,
+        .interpolation = interpolation,
+        .pull_mode = false
+      });
+      break;
     default:
       assert(0 && "Unexpected/unhandled input system value");
       break;
@@ -395,7 +420,7 @@ void handle_signature_ps(
     });
     max_input_register = std::max(reg + 1, max_input_register);
     if (sig.mask() == 0) break;
-    signature_handlers.push_back([=, type = sig.componentType(), name = sig.fullSemanticString()]
+    signature_handlers.push_back([=, type = sig.componentType(), name = sig.consistentAttributeName()]
     (SignatureContext &ctx) {
       bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;
       auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
@@ -586,7 +611,6 @@ void handle_signature_hs(
   uint32_t &max_output_register = sm50_shader->max_output_register;
   uint32_t &max_patch_constant_output_register =
     sm50_shader->max_patch_constant_output_register;
-  auto &signature_handlers = sm50_shader->signature_handlers;
 
   switch (Inst.m_OpCode) {
   case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
@@ -743,7 +767,6 @@ void handle_signature_ds(
 ) {
   uint32_t &max_input_register = sm50_shader->max_input_register;
   uint32_t &max_output_register = sm50_shader->max_output_register;
-  auto &signature_handlers = sm50_shader->signature_handlers;
   auto &func_signature = sm50_shader->func_signature;
   auto &mesh_output_handlers = sm50_shader->mesh_output_handlers;
   uint32_t &num_mesh_vertex_data = sm50_shader->num_mesh_vertex_data;
@@ -763,7 +786,6 @@ void handle_signature_ds(
   switch (Inst.m_OpCode) {
   case D3D10_SB_OPCODE_DCL_INPUT_SIV: {
     unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-    auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
     auto siv = Inst.m_OutputDeclSIV.Name;
     switch (siv) {
     case D3D11_SB_NAME_FINAL_QUAD_U_EQ_0_EDGE_TESSFACTOR:
@@ -841,9 +863,17 @@ void handle_signature_ds(
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
-    case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+    case D3D10_SB_NAME_CULL_DISTANCE: {
+      for (unsigned i = 0; i < 4; i++) {
+        if (mask & (1 << i)) {
+          sm50_shader->cull_distance_scalars.push_back(
+            {.component = (uint8_t)(i), .reg = (uint8_t)reg}
+          );
+        }
+      }
+      max_output_register = std::max(reg + 1, max_output_register);
       break;
+    }
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
       mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
@@ -887,7 +917,7 @@ void handle_signature_ds(
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
       auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.fullSemanticString(),
+        .user = sig.consistentAttributeName(),
         .type = type,
         .index = mesh_vertex_data_index
       });
@@ -1065,9 +1095,15 @@ handle_signature_gs(
       max_output_register = std::max(reg + 1, max_output_register);
       break;
     }
-    case D3D10_SB_NAME_CULL_DISTANCE:
-      assert(0 && "Metal doesn't support shader output: cull distance");
+    case D3D10_SB_NAME_CULL_DISTANCE: {
+      for (unsigned i = 0; i < 4; i++) {
+        if (mask & (1 << i)) {
+          sm50_shader->cull_distance_scalars.push_back({.component = (uint8_t)(i), .reg = (uint8_t)reg});
+        }
+      }
+      max_output_register = std::max(reg + 1, max_output_register);
       break;
+    }
     case D3D10_SB_NAME_POSITION: {
       func_signature.DefineMeshVertexOutput(OutputPosition{.type = msl_float4});
       mesh_output_handlers.push_back([=](MeshOutputContext& output) -> IREffect {
@@ -1111,7 +1147,7 @@ handle_signature_gs(
       auto const mesh_vertex_data_index = num_mesh_vertex_data++;
       auto const type = to_msl_type(sig.componentType());
       func_signature.DefineMeshVertexOutput(OutputMeshData{
-        .user = sig.fullSemanticString(),
+        .user = sig.consistentAttributeName(),
         .type = type,
         .index = mesh_vertex_data_index
       });

@@ -8,6 +8,7 @@
  * See <https://github.com/doitsujin/dxvk/blob/master/LICENSE>
  */
 
+#include "util_d3dkmt.h"
 #include "wsi_window.hpp"
 #include "wsi_monitor.hpp"
 
@@ -70,31 +71,6 @@ static bool setMonitorDisplayMode(HMONITOR hMonitor, DEVMODEW *pMode) {
   return status == DISP_CHANGE_SUCCESSFUL;
 }
 
-static BOOL CALLBACK restoreDisplayModeCallback(HMONITOR hMonitor, HDC hDC,
-                                                LPRECT pRect,
-                                                LPARAM pUserdata) {
-  auto success = reinterpret_cast<bool *>(pUserdata);
-
-  DEVMODEW devMode = {};
-  devMode.dmSize = sizeof(devMode);
-
-  if (!getMonitorDisplayMode(hMonitor, ENUM_REGISTRY_SETTINGS, &devMode)) {
-    *success = false;
-    return false;
-  }
-
-  Logger::info(str::format("Restoring display mode: ", devMode.dmPelsWidth, "x",
-                           devMode.dmPelsHeight, "@",
-                           devMode.dmDisplayFrequency));
-
-  if (!setMonitorDisplayMode(hMonitor, &devMode)) {
-    *success = false;
-    return false;
-  }
-
-  return true;
-}
-
 void getWindowSize(HWND hWindow, uint32_t *pWidth, uint32_t *pHeight) {
   RECT rect = {};
   ::GetClientRect(hWindow, &rect);
@@ -145,16 +121,22 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
         mode.refreshRate.numerator / mode.refreshRate.denominator;
   }
 
-  Logger::info(str::format("Setting display mode: ", devMode.dmPelsWidth, "x",
-                           devMode.dmPelsHeight, "@",
-                           devMode.dmDisplayFrequency));
-
   return setMonitorDisplayMode(hMonitor, &devMode);
 }
 
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
                          DXMTWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
+  RECT rect = {};
+  getDesktopCoordinates(hMonitor, &rect);
+
+  D3DKMT_ESCAPE escape = {};
+  escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
+  escape.pPrivateDriverData = &rect;
+  escape.PrivateDriverDataSize = sizeof(rect);
+  escape.hContext = HandleToUlong(hWindow);
+  D3DKMTEscape(&escape);
+
   // Find a display mode that matches what we need
   ::GetWindowRect(hWindow, &pState->rect);
 
@@ -170,9 +152,6 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
 
   ::SetWindowLongW(hWindow, GWL_STYLE, style);
   ::SetWindowLongW(hWindow, GWL_EXSTYLE, exstyle);
-
-  RECT rect = {};
-  getDesktopCoordinates(hMonitor, &rect);
 
   ::SetWindowPos(hWindow, HWND_TOPMOST, rect.left, rect.top,
                  rect.right - rect.left, rect.bottom - rect.top,
@@ -195,6 +174,14 @@ bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
     ::SetWindowLongW(hWindow, GWL_EXSTYLE, pState->exstyle);
   }
 
+  RECT empty = {};
+  D3DKMT_ESCAPE escape = {};
+  escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
+  escape.pPrivateDriverData = &empty;
+  escape.PrivateDriverDataSize = sizeof(empty);
+  escape.hContext = HandleToUlong(hWindow);
+  D3DKMTEscape(&escape);
+
   // Restore window position and apply the style
   UINT flags = SWP_FRAMECHANGED | SWP_NOACTIVATE;
   const RECT rect = pState->rect;
@@ -211,13 +198,28 @@ bool leaveFullscreenMode(HWND hWindow, DXMTWindowState *pState,
   return true;
 }
 
-bool restoreDisplayMode() {
-  bool success = true;
-  bool result =
-      ::EnumDisplayMonitors(nullptr, nullptr, &restoreDisplayModeCallback,
-                            reinterpret_cast<LPARAM>(&success));
-
-  return result && success;
+bool restoreDisplayMode(HMONITOR hMonitor) {
+  WCHAR device_name[32];
+  DEVMODEW current_mode, registry_mode;
+  getDisplayName(hMonitor, device_name);
+  if (!EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &current_mode, 0))
+    return false;
+  if (!EnumDisplaySettingsExW(device_name, ENUM_REGISTRY_SETTINGS, &registry_mode, 0))
+    return false;
+  do {
+    if (current_mode.dmPelsWidth != registry_mode.dmPelsWidth)
+      break;
+    if (current_mode.dmPelsHeight != registry_mode.dmPelsHeight)
+      break;
+    if (current_mode.dmBitsPerPel != registry_mode.dmBitsPerPel)
+      break;
+    if ((current_mode.dmFields & registry_mode.dmFields & DM_DISPLAYFREQUENCY) &&
+        current_mode.dmDisplayFrequency != registry_mode.dmDisplayFrequency)
+      break;
+    return true;
+  } while (0);
+  LONG ret = ChangeDisplaySettingsExW(device_name, NULL, NULL, 0, NULL);
+  return ret == DISP_CHANGE_SUCCESSFUL;
 }
 
 HMONITOR getWindowMonitor(HWND hWindow) {
@@ -239,6 +241,13 @@ void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
   RECT bounds = {};
   wsi::getDesktopCoordinates(hMonitor, &bounds);
 
+  D3DKMT_ESCAPE escape = {};
+  escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
+  escape.pPrivateDriverData = &bounds;
+  escape.PrivateDriverDataSize = sizeof(bounds);
+  escape.hContext = HandleToUlong(hWindow);
+  D3DKMTEscape(&escape);
+
   // In D3D9, changing display modes re-forces the window
   // to become top most, whereas in DXGI, it does not.
   if (forceTopmost) {
@@ -249,6 +258,14 @@ void updateFullscreenWindow(HMONITOR hMonitor, HWND hWindow,
     ::MoveWindow(hWindow, bounds.left, bounds.top, bounds.right - bounds.left,
                  bounds.bottom - bounds.top, TRUE);
   }
+}
+
+bool isForeground(HWND hWindow) {
+  return ::GetForegroundWindow() == hWindow;
+}
+
+bool isMinimized(HWND hWindow) {
+  return ::IsIconic(hWindow);
 }
 
 } // namespace dxmt::wsi

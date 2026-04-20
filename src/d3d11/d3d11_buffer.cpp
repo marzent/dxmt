@@ -17,7 +17,6 @@ struct BufferViewInfo {
 
 class D3D11Buffer : public TResourceBase<tag_buffer> {
 private:
-  Rc<Buffer> buffer_;
 #ifdef DXMT_DEBUG
   std::string debug_name;
 #endif
@@ -29,45 +28,37 @@ private:
   using SRVBase = TResourceViewBase<tag_shader_resource_view<D3D11Buffer>>;
 
   class TBufferSRV : public SRVBase {
-    BufferViewInfo info;
 
   public:
     TBufferSRV(
         const tag_shader_resource_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
         BufferViewInfo const &info
     ) :
-        SRVBase(pDesc, pResource, pDevice),
-        info(info) {}
+        SRVBase(pDesc, pResource, pDevice) {
+      buffer_ = pResource->buffer_.ptr();
+      view_id_ = info.viewKey;
+      slice_ = {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };
+      subset_ = ResourceSubsetState(info.byteOffset, info.byteWidth);
+    }
 
     ~TBufferSRV() {}
-
-    Rc<Buffer> buffer() final { return resource->buffer_; };
-    Rc<Texture> texture() final { return {}; };
-    unsigned viewId() final { return info.viewKey;};
-    BufferSlice bufferSlice() final { return {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };}
   };
 
   using UAVBase = TResourceViewBase<tag_unordered_access_view<D3D11Buffer>>;
 
   class UAVWithCounter : public UAVBase {
-  private:
-    BufferViewInfo info;
-    Rc<Buffer> counter_;
-
   public:
     UAVWithCounter(
         const tag_unordered_access_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
         BufferViewInfo const &info, Rc<Buffer>&& counter
     ) :
-        UAVBase(pDesc, pResource, pDevice),
-        info(info),
-        counter_(std::move(counter)) {}
-
-    Rc<Buffer> buffer() final { return resource->buffer_; };
-    Rc<Texture> texture() final { return {}; };
-    unsigned viewId() final { return info.viewKey;};
-    BufferSlice bufferSlice() final { return {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };}
-    Rc<Buffer> counter() final { return counter_; };
+        UAVBase(pDesc, pResource, pDevice) {
+      buffer_ = pResource->buffer_.ptr();
+      view_id_ = info.viewKey;
+      slice_ = {info.byteOffset, info.byteWidth, info.viewElementOffset, info.viewElementWidth };
+      counter_ = std::move(counter);
+      subset_ = ResourceSubsetState(info.byteOffset, info.byteWidth);
+    }
   };
 
 public:
@@ -118,18 +109,6 @@ public:
     return TResourceBase<tag_buffer>::QueryInterface(riid, ppvObject);
   }
 
-  Rc<Buffer>
-  buffer() final {
-    return buffer_;
-  };
-  Rc<Texture>
-  texture() final {
-    return {};
-  };
-  BufferSlice
-  bufferSlice() final {
-    return {0, desc.ByteWidth, 0, 0};
-  }
   Rc<StagingResource>
   staging(UINT Subresource) final {
     return nullptr;
@@ -251,7 +230,11 @@ public:
       viewElementWidth = finalDesc.Buffer.NumElements * (desc.StructureByteStride >> 2);
       if (finalDesc.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) {
         counter = new dxmt::Buffer(sizeof(uint32_t), m_parent->GetMTLDevice());
-        counter->rename(counter->allocate(BufferAllocationFlag::GpuManaged));
+        auto allocation = counter->allocate(BufferAllocationFlag::GpuManaged);
+        const uint32_t initial_counter = 0;
+        allocation->updateContents(0, &initial_counter, sizeof(initial_counter));
+        allocation->buffer().didModifyRange(0, sizeof(initial_counter));
+        counter->rename(std::move(allocation));
       }
     } else if (finalDesc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
       if (!allow_raw_view)

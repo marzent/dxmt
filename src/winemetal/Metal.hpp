@@ -204,6 +204,14 @@ class Fence : public Object {
 public:
 };
 
+class CounterSampleBuffer : public Object {
+public:
+  void
+  resolveCounterRange(uint32_t start, uint32_t len, void *data_out, uint64_t data_length) {
+    MTLCounterSampleBuffer_resolveCounterRange(handle, start, len, data_out, data_length);
+  }
+};
+
 class Resource : public Object {
 public:
 };
@@ -482,6 +490,19 @@ public:
     cmd.fence = fence.handle;
     MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
   }
+
+  void
+  resolveCounters(CounterSampleBuffer sample_buffer, uint32_t start, uint32_t len, Buffer dst, uint64_t dst_offset) {
+    struct wmtcmd_blit_resolvecounters cmd;
+    cmd.type = WMTBlitCommandResolveCounters;
+    cmd.next.set(nullptr);
+    cmd.sample_buffer = sample_buffer.handle;
+    cmd.start = start;
+    cmd.len = len;
+    cmd.dst_buffer = dst.handle;
+    cmd.dst_offset = dst_offset;
+    MTLBlitCommandEncoder_encodeCommands(handle, (const wmtcmd_base *)&cmd);
+  }
 };
 
 class ComputeCommandEncoder : public CommandEncoder {
@@ -593,6 +614,11 @@ public:
     return LogContainer{MTLCommandBuffer_logs(handle)};
   }
 
+  uint64_t
+  gpuEndTime() {
+    return MTLCommandBuffer_property(handle, WMTCommandBufferPropertyGPUEndTime);
+  }
+
   void
   encodeSignalEvent(Event event, uint64_t value) {
     return MTLCommandBuffer_encodeSignalEvent(handle, event.handle, value);
@@ -611,6 +637,11 @@ public:
   BlitCommandEncoder
   blitCommandEncoder() {
     return BlitCommandEncoder{MTLCommandBuffer_blitCommandEncoder(handle)};
+  }
+
+  BlitCommandEncoder
+  blitCommandEncoderWithSampleBuffers(WMTSampleBufferAttachmentInfo *attachments, uint64_t num_attachments) {
+    return BlitCommandEncoder{MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(handle, attachments, num_attachments)};
   }
 
   ComputeCommandEncoder
@@ -796,6 +827,11 @@ public:
     return Reference<RenderPipelineState>(MTLDevice_newMeshRenderPipelineState(handle, &info, &error.handle));
   }
 
+  Reference<RenderPipelineState>
+  newRenderPipelineState(const WMTTileRenderPipelineInfo &info, Error &error) {
+    return Reference<RenderPipelineState>(MTLDevice_newTileRenderPipelineState(handle, &info, &error.handle));
+  }
+
   Reference<Fence>
   newFence() {
     return Reference<Fence>(MTLDevice_newFence(handle));
@@ -864,6 +900,11 @@ public:
   Reference<Texture>
   newSharedTexture(WMTTextureInfo &info) {
     return Reference<Texture>(MTLDevice_newSharedTexture(handle, &info));
+  }
+
+  Reference<CounterSampleBuffer>
+  newCounterSampleBuffer(uint32_t sample_count, bool shared = true) {
+    return Reference<CounterSampleBuffer>(MTLCounterSampleBuffer_newTimestampBuffer(handle, sample_count, shared));
   }
 };
 
@@ -1071,6 +1112,22 @@ InitializeMeshRenderPipelineInfo(WMTMeshRenderPipelineInfo &info) {
   info.payload_memory_length = 0;
   info.mesh_tgsize_is_multiple_of_sgwidth = 0;
   info.object_tgsize_is_multiple_of_sgwidth = 0;
+  info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
+  info.binary_archives_for_lookup.set(nullptr);
+  info.num_binary_archives_for_lookup = 0;
+  info.fail_on_binary_archive_miss = false;
+}
+
+inline void
+InitializeTileRenderPipelineInfo(WMTTileRenderPipelineInfo &info) {
+  for (unsigned i = 0; i < 8; i++) {
+    info.color_formats[i] = WMTPixelFormatInvalid;
+  }
+  info.tile_function = NULL_OBJECT_HANDLE;
+  info.immutable_tile_buffers = 0;
+  info.raster_sample_count = 1;
+  info.tgsize_matches_tile_size = 0;
+
   info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;

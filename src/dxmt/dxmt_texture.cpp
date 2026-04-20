@@ -8,10 +8,40 @@ namespace dxmt {
 
 std::atomic_uint64_t global_texture_seq = {0};
 
+void
+TextureView::incRef() {
+  refcount_.fetch_add(1u, std::memory_order_acquire);
+};
+
+void
+TextureView::decRef() {
+  if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
+    delete this;
+};
+
+TextureView::TextureView(TextureAllocation *allocation) :
+    texture(allocation->texture()),
+    gpuResourceID(allocation->gpuResourceID),
+    allocation(allocation),
+    key(allocation->descriptor->fullView) {}
+
+TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureViewDescriptor descriptor) :
+    gpuResourceID(0),
+    allocation(allocation),
+    key(descriptor, index, allocation->descriptor->miplevelCount()) {
+  auto parent = allocation->texture();
+  texture = parent.newTextureView(
+      descriptor.format, descriptor.type, descriptor.firstMiplevel, descriptor.miplevelCount,
+      descriptor.firstArraySlice, descriptor.arraySize,
+      {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpuResourceID
+  );
+}
+
 TextureAllocation::TextureAllocation(
-    WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info, unsigned bytes_per_row,
-    Flags<TextureAllocationFlag> flags
+    Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
+    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
 ) :
+    descriptor(descriptor),
     mappedMemory(mapped_buffer),
     buffer_(std::move(buffer)),
     flags_(flags) {
@@ -20,18 +50,24 @@ TextureAllocation::TextureAllocation(
 
   gpuResourceID = info_copy.gpu_resource_id;
   machPort = 0;
-  depkey = EncoderDepSet::generateNewKey(global_texture_seq.fetch_add(1));
+  fenceTrackers.resize(
+      flags.test(TextureAllocationFlag::ShaderReadonly) ? 1 : descriptor->arrayLength() * descriptor->miplevelCount()
+  );
 };
 
 TextureAllocation::TextureAllocation(
-    WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor, Flags<TextureAllocationFlag> flags
+    Texture *descriptor, WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor,
+    Flags<TextureAllocationFlag> flags
 ) :
+    descriptor(descriptor),
     obj_(std::move(texture)),
     flags_(flags) {
   mappedMemory = nullptr;
   gpuResourceID = textureDescriptor.gpu_resource_id;
   machPort = textureDescriptor.mach_port;
-  depkey = EncoderDepSet::generateNewKey(global_texture_seq.fetch_add(1));
+  fenceTrackers.resize(
+      flags.test(TextureAllocationFlag::ShaderReadonly) ? 1 : descriptor->arrayLength() * descriptor->miplevelCount()
+  );
 };
 
 TextureAllocation::~TextureAllocation(){
@@ -42,27 +78,20 @@ TextureAllocation::~TextureAllocation(){
 
 void
 Texture::prepareAllocationViews(TextureAllocation *allocaiton) {
-  std::unique_lock<dxmt::mutex> lock(mutex_);
   if (allocaiton->version_ < 1) {
-    allocaiton->cached_view_.push_back(std::make_unique<TextureView>(allocaiton->obj_, allocaiton->gpuResourceID));
+    allocaiton->cached_view_.push_back(new TextureView(allocaiton));
     allocaiton->version_ = 1;
   }
+  std::shared_lock<dxmt::shared_mutex> lock(mutex_);
   for (unsigned version = allocaiton->version_; version < version_; version++) {
-    auto &texture = allocaiton->obj_;
-    auto &view = viewDescriptors_[version];
-    uint64_t gpu_resource_id;
-    WMT::Reference<WMT::Texture> ref = texture.newTextureView(
-        view.format, view.type, view.firstMiplevel, view.miplevelCount, view.firstArraySlice, view.arraySize,
-        {WMTTextureSwizzleRed, WMTTextureSwizzleGreen, WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha}, gpu_resource_id
-    );
-    allocaiton->cached_view_.push_back(std::make_unique<TextureView>(std::move(ref), gpu_resource_id));
+    allocaiton->cached_view_.push_back(new TextureView(allocaiton, version, viewDescriptors_[version]));
   }
   allocaiton->version_ = version_;
 }
 
 TextureViewKey
 Texture::createView(TextureViewDescriptor const &descriptor) {
-  std::unique_lock<dxmt::mutex> lock(mutex_);
+  std::unique_lock<dxmt::shared_mutex> lock(mutex_);
   unsigned i = 0;
   for (; i < version_; i++) {
     if (viewDescriptors_[i].format != descriptor.format)
@@ -77,26 +106,16 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
       continue;
     if (viewDescriptors_[i].arraySize != descriptor.arraySize)
       continue;
-    return i;
+    return TextureViewKey(descriptor, i, info_.mipmap_level_count);
   }
   viewDescriptors_.push_back(descriptor);
   version_ = version_ + 1;
-  return i;
+  return TextureViewKey(descriptor, i, info_.mipmap_level_count);
 }
 
 Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
     info_(descriptor),
     device_(device) {
-
-  uint32_t arraySize = info_.array_length;
-  switch (info_.type) {
-  case WMTTextureTypeCubeArray:
-  case WMTTextureTypeCube:
-    arraySize = arraySize * 6;
-    break;
-  default:
-    break;
-  }
 
   viewDescriptors_.push_back({
       .format = info_.pixel_format,
@@ -104,9 +123,10 @@ Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
       .firstMiplevel = 0,
       .miplevelCount = info_.mipmap_level_count,
       .firstArraySlice = 0,
-      .arraySize = arraySize,
+      .arraySize = arrayLength(),
   });
   version_ = 1;
+  fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
 
 Texture::Texture(
@@ -130,16 +150,14 @@ Texture::Texture(
       .arraySize = 1,
   });
   version_ = 1;
+  fullView = TextureViewKey(viewDescriptors_[0], 0, info_.mipmap_level_count);
 }
 
 Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
-  WMTResourceOptions options = WMTResourceStorageModeShared;
+  WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   WMTTextureInfo info = info_; // copy
   info.mach_port = 0;
-  if (flags.test(TextureAllocationFlag::GpuReadonly)) {
-    options |= WMTResourceHazardTrackingModeUntracked;
-  }
   if (flags.test(TextureAllocationFlag::CpuWriteCombined)) {
     options |= WMTResourceOptionCPUCacheModeWriteCombined;
   }
@@ -159,10 +177,10 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
     buffer_info.memory.set(wsi::aligned_malloc(bytes_per_image_, DXMT_PAGE_SIZE));
 #endif
     auto buffer = device_.newBuffer(buffer_info);
-    return new TextureAllocation(std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
+    return new TextureAllocation(this, std::move(buffer), buffer_info.memory.get(), info, bytes_per_row_, flags);
   }
   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
-  return new TextureAllocation(std::move(texture), info, flags);
+  return new TextureAllocation(this, std::move(texture), info, flags);
 }
 
 Rc<TextureAllocation>
@@ -181,39 +199,32 @@ Texture::import(mach_port_t mach_port) {
       flags.set(TextureAllocationFlag::GpuPrivate);
     if (info.options & WMTResourceHazardTrackingModeUntracked)
       flags.set(TextureAllocationFlag::NoTracking);
+    if ((info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)) == 0)
+      flags.set(TextureAllocationFlag::ShaderReadonly);
     flags.set(TextureAllocationFlag::Shared);
-    return new TextureAllocation(std::move(texture), info, flags);
+    return new TextureAllocation(this, std::move(texture), info, flags);
   }
   assert(texture && "failed to import shared texture");
   return nullptr;
 }
 
-WMT::Texture
+TextureView &
 Texture::view(TextureViewKey key) {
   return view(key, current_.ptr());
 }
 
-WMT::Texture
+TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
-  return view_(key, allocation).texture;
-}
-
-TextureView const &
-Texture::view_(TextureViewKey key) {
-  return view_(key, current_.ptr());
-}
-
-TextureView const &
-Texture::view_(TextureViewKey key, TextureAllocation* allocation) {
   if (unlikely(allocation->version_ != version_)) {
     prepareAllocationViews(allocation);
   }
-  return *allocation->cached_view_[key];
+  return *allocation->cached_view_[key.index];
 }
 
-
 TextureViewKey Texture::checkViewUseArray(TextureViewKey key, bool isArray) {
-  auto &view = viewDescriptors_[key];
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
   static constexpr uint32_t ARRAY_TYPE_MASK = 0b0101001010;
   if (unlikely(bool((1 << uint32_t(view.type)) & ARRAY_TYPE_MASK) != isArray)) {
     // TODO: this process can be cached
@@ -260,26 +271,15 @@ TextureViewKey Texture::checkViewUseArray(TextureViewKey key, bool isArray) {
 }
 
 TextureViewKey Texture::checkViewUseFormat(TextureViewKey key, WMTPixelFormat format) {
-  auto &view = viewDescriptors_[key];
+  std::shared_lock<dxmt::shared_mutex> shared_lock(mutex_);
+  auto view = viewDescriptors_[key.index];
+  shared_lock = {};
   if (unlikely(view.format != format)) {
     auto new_view_desc = view;
     new_view_desc.format = format;
     return createView(new_view_desc);
   }
   return key;
-}
-
-DXMT_RESOURCE_RESIDENCY_STATE &
-Texture::residency(TextureViewKey key) {
-  return residency(key, current_.ptr());
-}
-
-DXMT_RESOURCE_RESIDENCY_STATE &
-Texture::residency(TextureViewKey key, TextureAllocation *allocation) {
-  if (unlikely(allocation->version_ != version_)) {
-    prepareAllocationViews(allocation);
-  }
-  return allocation->cached_view_[key]->residency;
 }
 
 Rc<TextureAllocation>

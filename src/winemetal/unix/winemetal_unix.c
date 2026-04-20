@@ -301,7 +301,7 @@ _MTLBuffer_newTexture(void *obj) {
   return STATUS_SUCCESS;
 }
 
-inline MTLTextureSwizzleChannels
+static inline MTLTextureSwizzleChannels
 to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat format) {
   if (format & WMTPixelFormatRGB1Swizzle) {
     return MTLTextureSwizzleChannelsMake(
@@ -478,6 +478,11 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   descriptor.renderTargetHeight = info->render_target_height;
   descriptor.renderTargetWidth = info->render_target_width;
   descriptor.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+
+  if (info->tile_height && info->tile_width) {
+    descriptor.tileWidth = info->tile_width;
+    descriptor.tileHeight = info->tile_height;
+  }
 
   params->ret = (obj_handle_t)[(id<MTLCommandBuffer>)params->handle renderCommandEncoderWithDescriptor:descriptor];
 
@@ -748,6 +753,14 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
       [encoder fillBuffer:(id<MTLBuffer>)body->buffer range:NSMakeRange(body->offset, body->length) value:body->value];
       break;
     }
+    case WMTBlitCommandResolveCounters: {
+      struct wmtcmd_blit_resolvecounters *body = (struct wmtcmd_blit_resolvecounters *)next;
+      [encoder resolveCounters:(id<MTLCounterSampleBuffer>)body->sample_buffer
+                       inRange:NSMakeRange(body->start, body->len)
+             destinationBuffer:(id<MTLBuffer>)body->dst_buffer
+             destinationOffset:body->dst_offset];
+      break;
+    }
     }
 
     next = next->next.ptr;
@@ -826,6 +839,11 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     case WMTComputeCommandWaitForFence: {
       struct wmtcmd_compute_fence_op *body = (struct wmtcmd_compute_fence_op *)next;
       [encoder waitForFence:(id<MTLFence>)body->fence];
+      break;
+    }
+    case WMTComputeCommandMemoryBarrier: {
+      struct wmtcmd_compute_memory_barrier *body = (struct wmtcmd_compute_memory_barrier *)next;
+      [encoder memoryBarrierWithScope:(MTLBarrierScope)body->scope];
       break;
     }
     }
@@ -1130,6 +1148,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setScissorRect:u.dst];
       break;
     }
+    case WMTRenderCommandDispatchThreadsPerTile: {
+      struct wmtcmd_render_dispatch_threads_per_tile *body = (struct wmtcmd_render_dispatch_threads_per_tile *)next;
+      [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
+      break;
+    }
     }
     next = next->next.ptr;
   }
@@ -1278,7 +1301,7 @@ _MTLCaptureManager_stopCapture(void *obj) {
 
 void
 temp_handler(int signum) {
-  printf("received signal %d in temp_handler(), and it may cause problem!\n", signum);
+  fprintf(stderr, "received signal %d in temp_handler(), and it may cause problem!\n", signum);
 }
 
 static const int SIGNALS[] = {
@@ -1341,17 +1364,20 @@ _MTLDevice_newTemporalScaler(void *obj) {
   desc.autoExposureEnabled = info->auto_exposure;
 
   struct sigaction old_action[sizeof(SIGNALS) / sizeof(int)], new_action;
-  new_action.sa_handler = temp_handler;
-  sigemptyset(&new_action.sa_mask);
-  new_action.sa_flags = 0;
-
-  for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
-    sigaction(SIGNALS[i], &new_action, &old_action[i]);
+  if (@available(macOS 16, *)) {} else {
+    new_action.sa_handler = temp_handler;
+    sigemptyset(&new_action.sa_mask);
+    new_action.sa_flags = 0;
+    for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
+      sigaction(SIGNALS[i], &new_action, &old_action[i]);
+  }
 
   params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:(id<MTLDevice>)params->device];
 
-  for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
-    sigaction(SIGNALS[i], &old_action[i], NULL);
+  if (@available(macOS 16, *)) {} else {
+    for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
+      sigaction(SIGNALS[i], &old_action[i], NULL);
+  }
 
   [desc release];
   return STATUS_SUCCESS;
@@ -1763,6 +1789,7 @@ struct SM50_SHADER_COMMON_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
   enum SM50_SHADER_METAL_VERSION metal_version;
+  enum SM50_SHADER_FLAG flag;
 };
 
 struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
@@ -1846,6 +1873,7 @@ sm50_compilation_argument32_convert(
       last_arg->next = NULL;
       data->type = src->type;
       data->metal_version = src->metal_version;
+      data->flags = src->flag;
       break;
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
@@ -2657,6 +2685,137 @@ _MTLSharedEvent_waitUntilSignaledValue(void *obj) {
   return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+_MTLCounterSampleBuffer_newTimestampBuffer(void *obj) {
+  struct unixcall_mtlcountersamplebuffer_newtimestampbuffer *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+
+  MTLCounterSampleBufferDescriptor *desc = [[MTLCounterSampleBufferDescriptor alloc] init];
+  NSArray<id<MTLCounterSet>> *counter_sets = [device counterSets];
+  id<MTLCounterSet> timestamp_counter_set = nil;
+  for (id<MTLCounterSet> counterSet in counter_sets) {
+    if ([counterSet.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+      timestamp_counter_set = counterSet;
+      break;
+    }
+  }
+  desc.counterSet = timestamp_counter_set;
+  desc.sampleCount = params->sample_count;
+  desc.storageMode = params->shared ? MTLStorageModeShared : MTLStorageModePrivate;
+
+  NSError *error = nil;
+  params->ret = (obj_handle_t)[device newCounterSampleBufferWithDescriptor:desc error:&error];
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCounterSampleBuffer_resolveCounterRange(void *obj) {
+  struct unixcall_mtlcountersamplebuffer_resolvecounterrange *params = obj;
+  id<MTLCounterSampleBuffer> sample_buffer = (id<MTLCounterSampleBuffer>)params->sample_buffer;
+
+  NSData *data = [sample_buffer resolveCounterRange:NSMakeRange(params->start, params->len)];
+  if (data && params->data_out.ptr) {
+    [data getBytes:params->data_out.ptr length:params->data_length];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
+  struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
+  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
+  struct WMTSampleBufferAttachmentInfo *attachments = params->attachments.ptr;
+
+  MTLBlitPassDescriptor *blit_desc = [[MTLBlitPassDescriptor alloc] init];
+  for (uint64_t i = 0; i < params->num_attachments; i++) {
+    MTLBlitPassSampleBufferAttachmentDescriptor *desc = blit_desc.sampleBufferAttachments[i];
+    desc.sampleBuffer = (id<MTLCounterSampleBuffer>)attachments[i].sample_buffer;
+    desc.startOfEncoderSampleIndex = attachments[i].start_of_encoder_sample_index;
+    desc.endOfEncoderSampleIndex = attachments[i].end_of_encoder_sample_index;
+  }
+
+  params->ret = (obj_handle_t)[cmdbuf blitCommandEncoderWithDescriptor:blit_desc];
+
+  [blit_desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_property(void *obj) {
+  struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->handle;
+  double ns = 1000000000;
+  switch (params->arg) {
+  case WMTCommandBufferPropertyKernelStartTime:
+    params->ret = (uint64_t)([cmdbuf kernelStartTime] * ns);
+    break;
+  case WMTCommandBufferPropertyKernelEndTime:
+    params->ret = (uint64_t)([cmdbuf kernelEndTime] * ns);
+    break;
+  case WMTCommandBufferPropertyGPUStartTime:
+    params->ret = (uint64_t)([cmdbuf GPUStartTime] * ns);
+    break;
+  case WMTCommandBufferPropertyGPUEndTime:
+    params->ret = (uint64_t)([cmdbuf GPUEndTime] * ns);
+    break;
+  default:
+    params->ret = 0;
+    break;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newTileRenderPipelineState(void *obj) {
+  struct unixcall_mtldevice_newrenderpso *params = obj;
+  const struct WMTTileRenderPipelineInfo *info = params->info.ptr;
+  MTLTileRenderPipelineDescriptor *descriptor = [[MTLTileRenderPipelineDescriptor alloc] init];
+
+  for (unsigned i = 0; i < 8; i++) {
+    descriptor.colorAttachments[i].pixelFormat = to_metal_pixel_format(info->color_formats[i]);
+  }
+
+  for (unsigned i = 0; i < 31; i++) {
+    if (info->immutable_tile_buffers & (1 << i))
+      descriptor.tileBuffers[i].mutability = MTLMutabilityImmutable;
+  }
+
+  descriptor.rasterSampleCount = info->raster_sample_count;
+  descriptor.threadgroupSizeMatchesTileSize = info->tgsize_matches_tile_size;
+
+
+  descriptor.tileFunction = (id<MTLFunction>)info->tile_function;
+
+  MTLPipelineOption options = MTLPipelineOptionNone;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+  if (@available(macOS 15, *)) {
+    if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
+      descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
+                                                      count:info->num_binary_archives_for_lookup];
+    options = info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
+  }
+#endif
+  NSError *err = NULL;
+  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithTileDescriptor:descriptor
+                                                                                                  options:options
+                                                                                               reflection:nil
+                                                                                                    error:&err];
+  params->ret_error = (obj_handle_t)err;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+  if (@available(macOS 15, *)) {
+    if (!err && info->binary_archive_for_serialization) {
+      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
+          addTileRenderPipelineFunctionsWithDescriptor:descriptor
+                                                 error:&err];
+    }
+  }
+#endif
+  [descriptor release];
+  return STATUS_SUCCESS;
+}
+
 /*
  * Definition from cache.c
  */
@@ -2795,6 +2954,11 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_newSharedEventWithMachPort,
     &_MTLDevice_registryID,
     &_MTLSharedEvent_waitUntilSignaledValue,
+    &_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_MTLCounterSampleBuffer_resolveCounterRange,
+    &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+    &_MTLCommandBuffer_property,
+    &_MTLDevice_newTileRenderPipelineState,
 };
 
 #ifndef DXMT_NATIVE
@@ -2926,5 +3090,10 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_newSharedEventWithMachPort,
     &_MTLDevice_registryID,
     &_MTLSharedEvent_waitUntilSignaledValue,
+    &_MTLCounterSampleBuffer_newTimestampBuffer,
+    &_MTLCounterSampleBuffer_resolveCounterRange,
+    &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+    &_MTLCommandBuffer_property,
+    &_MTLDevice_newTileRenderPipelineState,
 };
 #endif

@@ -134,12 +134,12 @@ int main(int argc, char **argv) {
   Context.setOpaquePointers(false);
   cl::ParseCommandLineOptions(argc, argv, "DXBC to Metal AIR transpiler\n");
 
-  bool FastMath = true;
-  for (StringRef Flag : f) {
-    if (Flag == "no-fast-math") {
-      FastMath = false;
-    }
-  }
+  // bool FastMath = true;
+  // for (StringRef Flag : f) {
+  //   if (Flag == "no-fast-math") {
+  //     FastMath = false;
+  //   }
+  // }
 
   if (OutputFilename.empty()) { // Unspecified output, infer it.
     if (InputFilename == "-") {
@@ -217,6 +217,7 @@ int main(int argc, char **argv) {
 
   SM50_SHADER_COMMON_DATA data;
   data.metal_version = SM50_SHADER_METAL_320;
+  data.flags = {};
   data.next = 0;
   data.type = SM50_SHADER_COMMON;
 

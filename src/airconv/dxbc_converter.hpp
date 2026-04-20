@@ -378,6 +378,10 @@ public:
     return semantic_name_ + std::to_string(semantic_index_);
   }
 
+  std::string consistentAttributeName() const {
+    return "reg" + std::to_string(register_) + "_" + std::to_string(std::countr_zero(mask_ & 0xFu));
+  }
+
   uint32_t stream() const { return stream_; }
 
   uint32_t mask() const { return mask_; }
@@ -427,6 +431,7 @@ public:
   std::vector<PatchConstantScalarInfo> patch_constant_scalars;
   uint32_t hull_maximum_threads_per_patch = 0;
   std::vector<ScalarInfo> clip_distance_scalars;
+  std::vector<ScalarInfo> cull_distance_scalars;
   microsoft::D3D10_SB_PRIMITIVE gs_input_primitive = {};
   std::vector<std::function<IREffect(MeshOutputContext &)>> mesh_output_handlers;
   uint32_t num_mesh_vertex_data = 0;

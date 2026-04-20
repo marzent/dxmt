@@ -15,7 +15,7 @@ namespace dxmt {
 
 struct UAV_B {
   IUnknown *RawPointer = 0;
-  Com<D3D11UnorderedAccessView> View;
+  Com<D3D11UnorderedAccessView, false> View;
 };
 
 typedef BindingSet<UAV_B, 64> UAVBindingSet;
@@ -32,7 +32,7 @@ struct D3D11ComputeStageState {
 
 struct CONSTANT_BUFFER_B {
   IUnknown *RawPointer = 0;
-  Com<D3D11ResourceCommon> Buffer;
+  Com<D3D11ResourceCommon, false> Buffer;
   UINT FirstConstant;
   UINT NumConstants;
 };
@@ -61,7 +61,7 @@ template <> struct redunant_binding_trait<SAMPLER_B> {
 
 struct SRV_B {
   IUnknown *RawPointer = 0;
-  Com<D3D11ShaderResourceView> SRV;
+  Com<D3D11ShaderResourceView, false> SRV;
 };
 
 typedef BindingSet<SRV_B, 128> SRVBindingSet;
@@ -81,7 +81,7 @@ struct D3D11ShaderStageState {
 
 struct VERTEX_BUFFER_B {
   IUnknown *RawPointer = 0;
-  Com<D3D11ResourceCommon> Buffer;
+  Com<D3D11ResourceCommon, false> Buffer;
   UINT Stride;
   UINT Offset;
 };
@@ -96,7 +96,7 @@ template <> struct redunant_binding_trait<VERTEX_BUFFER_B> {
 struct D3D11InputAssemblerStageState {
   Com<IMTLD3D11InputLayout> InputLayout;
   BindingSet<VERTEX_BUFFER_B, 16> VertexBuffers;
-  Com<D3D11ResourceCommon> IndexBuffer;
+  Com<D3D11ResourceCommon, false> IndexBuffer;
   /**
   either DXGI_FORMAT_R16_UINT or DXGI_FORMAT_R32_UINT
   */
@@ -106,11 +106,13 @@ struct D3D11InputAssemblerStageState {
 };
 
 struct D3D11OutputMergerStageState {
-  Com<D3D11RenderTargetView> RTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-  Com<D3D11DepthStencilView> DSV;
+  Com<D3D11RenderTargetView, false> RTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+  Com<D3D11DepthStencilView, false> DSV;
   UINT NumRTVs;
 
   UAVBindingSet UAVs;
+  UINT MinUAVBinding = D3D11_1_UAV_SLOT_COUNT;
+  UINT MaxUAVBinding = 0;
 
   IMTLD3D11DepthStencilState* DepthStencilState;
   UINT StencilRef;
@@ -129,7 +131,7 @@ struct D3D11OutputMergerStageState {
 
 struct STREAM_OUTPUT_BUFFER_B {
   IUnknown *RawPointer = 0;
-  Com<D3D11ResourceCommon> Buffer;
+  Com<D3D11ResourceCommon, false> Buffer;
   UINT Offset;
 };
 

@@ -11,7 +11,7 @@
 #define STATIC_ASSERT(x)
 #endif
 
-#ifndef DXMT_NATIVE
+#ifdef _WIN32
 #define WINEMETAL_IMPORT __declspec(dllimport)
 #else
 #define WINEMETAL_IMPORT
@@ -433,20 +433,20 @@ enum WMTPixelFormat : uint32_t {
   WMTPixelFormatX32_Stencil8 = 261,
   WMTPixelFormatX24_Stencil8 = 262,
 
-  WMTPixelFormatAlphaIsOne = 0x80000000,
+  WMTPixelFormatAlphaIsOne = 0x00800000,
   WMTPixelFormatBGRX8Unorm = WMTPixelFormatAlphaIsOne | WMTPixelFormatBGRA8Unorm,
   WMTPixelFormatBGRX8Unorm_sRGB = WMTPixelFormatAlphaIsOne | WMTPixelFormatBGRA8Unorm_sRGB,
 
   WMTPixelFormatRGB1Swizzle = WMTPixelFormatAlphaIsOne,
-  WMTPixelFormatR001Swizzle = 0x40000000,
-  WMTPixelFormat0R01Swizzle = 0x20000000,
+  WMTPixelFormatR001Swizzle = 0x00400000,
+  WMTPixelFormat0R01Swizzle = 0x00200000,
 
   WMTPixelFormatR32X8X32 = WMTPixelFormatR001Swizzle | WMTPixelFormatDepth32Float_Stencil8,
   // WMTPixelFormatR24X8 = WMTPixelFormatR001Swizzle | WMTPixelFormatDepth24Unorm_Stencil8,
   WMTPixelFormatX32G8X32 = WMTPixelFormat0R01Swizzle | WMTPixelFormatX32_Stencil8,
   // WMTPixelFormatX24G8 = WMTPixelFormat0R01Swizzle | WMTPixelFormatX24_Stencil8,
 
-  WMTPixelFormatGBARSwizzle = 0x10000000,
+  WMTPixelFormatGBARSwizzle = 0x00100000,
 
   WMTPixelFormatBGRA4Unorm = WMTPixelFormatGBARSwizzle | WMTPixelFormatABGR4Unorm,
 
@@ -455,7 +455,7 @@ enum WMTPixelFormat : uint32_t {
 
 #define ORIGINAL_FORMAT(format) (format & ~WMTPixelFormatCustomSwizzle)
 
-enum WMTTextureType : uint8_t {
+enum WMTTextureType : uint32_t {
   WMTTextureType1D = 0,
   WMTTextureType1DArray = 1,
   WMTTextureType2D = 2,
@@ -468,7 +468,7 @@ enum WMTTextureType : uint8_t {
   WMTTextureTypeTextureBuffer = 9,
 };
 
-enum WMTTextureUsage : uint8_t {
+enum WMTTextureUsage : uint32_t {
   WMTTextureUsageUnknown = 0,
   WMTTextureUsageShaderRead = 1,
   WMTTextureUsageShaderWrite = 2,
@@ -499,10 +499,10 @@ struct WMTTextureInfo {
   uint32_t height;
   uint32_t depth;
   uint32_t array_length;
-  enum WMTTextureType type;
-  uint8_t mipmap_level_count;
-  uint8_t sample_count;
-  enum WMTTextureUsage usage;
+  enum WMTTextureType type    : 8;
+  uint32_t mipmap_level_count : 8;
+  uint32_t sample_count       : 8;
+  enum WMTTextureUsage usage  : 8;
   enum WMTResourceOptions options;
   uint32_t reserved;
   mach_port_t mach_port; // in/out
@@ -668,7 +668,9 @@ struct WMTRenderPassInfo {
   struct WMTDepthAttachmentInfo depth;
   struct WMTStencilAttachmentInfo stencil;
   uint8_t default_raster_sample_count;
-  uint16_t render_target_array_length;
+  uint8_t render_target_array_length;
+  uint8_t tile_width;
+  uint8_t tile_height;
   uint32_t render_target_height;
   uint32_t render_target_width;
   obj_handle_t visibility_buffer;
@@ -860,6 +862,7 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandWaitForFence,
   WMTBlitCommandUpdateFence,
   WMTBlitCommandFillBuffer,
+  WMTBlitCommandResolveCounters,
 };
 
 struct wmtcmd_base {
@@ -954,6 +957,17 @@ struct wmtcmd_blit_fillbuffer {
   uint8_t value;
 };
 
+struct wmtcmd_blit_resolvecounters {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t sample_buffer;
+  uint32_t start;
+  uint32_t len;
+  obj_handle_t dst_buffer;
+  uint64_t dst_offset;
+};
+
 WINEMETAL_API void MTLBlitCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 enum WMTComputeCommandType : uint16_t {
@@ -969,6 +983,7 @@ enum WMTComputeCommandType : uint16_t {
   WMTComputeCommandDispatchThreads,
   WMTComputeCommandWaitForFence,
   WMTComputeCommandUpdateFence,
+  WMTComputeCommandMemoryBarrier,
 };
 
 struct wmtcmd_compute_nop {
@@ -1055,6 +1070,19 @@ struct wmtcmd_compute_fence_op {
   obj_handle_t fence;
 };
 
+enum WMTBarrierScope : uint8_t {
+  WMTBarrierScopeBuffers = 1,
+  WMTBarrierScopeTextures = 2,
+  WMTBarrierScopeRenderTargets = 4,
+};
+
+struct wmtcmd_compute_memory_barrier {
+enum WMTComputeCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  enum WMTBarrierScope scope;
+};
+
 WINEMETAL_API void MTLComputeCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
 
 enum WMTRenderCommandType : uint16_t {
@@ -1099,6 +1127,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDXMTTessellationMeshDrawIndexed,
   WMTRenderCommandDXMTTessellationMeshDrawIndirect,
   WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
+  WMTRenderCommandDispatchThreadsPerTile,
 };
 
 struct wmtcmd_render_nop {
@@ -1113,6 +1142,7 @@ enum WMTRenderStages : uint8_t {
   WMTRenderStageTile = 4,
   WMTRenderStageObject = 8,
   WMTRenderStageMesh = 16,
+  WMTRenderStagePreRaster = WMTRenderStageVertex | WMTRenderStageObject | WMTRenderStageMesh,
 };
 
 struct wmtcmd_render_useresource {
@@ -1283,12 +1313,6 @@ struct wmtcmd_render_draw_meshthreadgroups_indirect {
   uint64_t indirect_args_offset;
   struct WMTSize object_threadgroup_size;
   struct WMTSize mesh_threadgroup_size;
-};
-
-enum WMTBarrierScope : uint8_t {
-  WMTBarrierScopeBuffers = 1,
-  WMTBarrierScopeTextures = 2,
-  WMTBarrierScopeRenderTargets = 4,
 };
 
 struct wmtcmd_render_memory_barrier {
@@ -1471,6 +1495,14 @@ struct wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect {
   uint64_t index_buffer_offset;
   uint32_t threads_per_patch;
   uint32_t patch_per_group;
+};
+
+struct wmtcmd_render_dispatch_threads_per_tile {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  uint32_t width;
+  uint32_t height;
 };
 
 WINEMETAL_API void MTLRenderCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head);
@@ -1847,5 +1879,49 @@ WINEMETAL_API obj_handle_t MTLDevice_newSharedEventWithMachPort(obj_handle_t dev
 WINEMETAL_API uint64_t MTLDevice_registryID(obj_handle_t device);
 
 WINEMETAL_API bool MTLSharedEvent_waitUntilSignaledValue(obj_handle_t event, uint64_t value, uint64_t timeout);
+
+WINEMETAL_API obj_handle_t
+MTLCounterSampleBuffer_newTimestampBuffer(obj_handle_t device, uint32_t sample_count, bool shared);
+
+WINEMETAL_API void MTLCounterSampleBuffer_resolveCounterRange(
+    obj_handle_t sample_buffer, uint32_t start, uint32_t len, void *data_out, uint64_t data_length
+);
+
+struct WMTSampleBufferAttachmentInfo {
+  obj_handle_t sample_buffer;
+  uint64_t start_of_encoder_sample_index;
+  uint64_t end_of_encoder_sample_index;
+};
+
+WINEMETAL_API obj_handle_t MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(
+    obj_handle_t cmdbuf, struct WMTSampleBufferAttachmentInfo *sample_buffer_attachments,
+    uint64_t num_sample_buffer_attachments
+);
+
+enum WMTCommandBufferProperty : uint32_t {
+  WMTCommandBufferPropertyKernelStartTime,
+  WMTCommandBufferPropertyKernelEndTime,
+  WMTCommandBufferPropertyGPUStartTime,
+  WMTCommandBufferPropertyGPUEndTime,
+};
+
+WINEMETAL_API uint64_t MTLCommandBuffer_property(obj_handle_t cmdbuf, enum WMTCommandBufferProperty prop);
+
+struct WMTTileRenderPipelineInfo {
+  enum WMTPixelFormat color_formats[8];
+  obj_handle_t tile_function;
+  uint32_t immutable_tile_buffers;
+  uint8_t raster_sample_count;
+  bool tgsize_matches_tile_size;
+  obj_handle_t binary_archive_for_serialization;
+  struct WMTConstMemoryPointer binary_archives_for_lookup;
+  uint8_t num_binary_archives_for_lookup;
+  bool fail_on_binary_archive_miss;
+  uint8_t padding[6];
+};
+
+WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineState(
+    obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
+);
 
 #endif

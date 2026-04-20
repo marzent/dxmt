@@ -306,6 +306,9 @@ public:
   void
   STDMETHODCALLTYPE
   Begin(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     // in theory pAsync could be any of them: { Query, Predicate, Counter }.
@@ -319,10 +322,9 @@ public:
       break;
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
-      auto query = static_cast<IMTLD3DOcclusionQuery *>(pAsync);
-      if (query->Begin())
-        EmitST([query_ = query->__query()](ArgumentEncodingContext &enc) mutable {
-          enc.beginVisibilityResultQuery(std::move(query_));
+      if (auto query = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->Begin())
+        EmitST([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.beginVisibilityResultQuery(std::move(query));
         });
       break;
     }
@@ -340,12 +342,14 @@ public:
   void
   STDMETHODCALLTYPE
   End(ID3D11Asynchronous *pAsync) override {
+    if (unlikely(!pAsync))
+      return;
+
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     D3D11_QUERY_DESC desc;
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
-    case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_EVENT: {
       if (ctx_state.has_dirty_op_since_last_event) {
@@ -362,12 +366,21 @@ public:
       }
       break;
     }
+    case D3D11_QUERY_TIMESTAMP: {
+      if (auto query = static_cast<MTLD3D11TimestampQuery *>(pAsync)->End()) {
+        InvalidateCurrentPass(true);
+        EmitOP([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.sampleTimestamp(std::move(query));
+        });
+        promote_flush = true;
+      }
+      break;
+    }
     case D3D11_QUERY_OCCLUSION:
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
-      auto query = static_cast<IMTLD3DOcclusionQuery *>(pAsync);
-      if (query->End())
-        EmitST([qeury_ = query->__query()](ArgumentEncodingContext &enc) mutable {
-          enc.endVisibilityResultQuery(std::move(qeury_));
+      if (auto query = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->End())
+        EmitST([query = Rc(query)](ArgumentEncodingContext &enc) mutable {
+          enc.endVisibilityResultQuery(std::move(query));
         });
       promote_flush = true;
       break;
@@ -398,7 +411,6 @@ public:
     ((ID3D11Query *)pAsync)->GetDesc(&desc);
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
-    case D3D11_QUERY_TIMESTAMP:
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
       switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
       case EventState::Pending:
@@ -426,18 +438,19 @@ public:
     case D3D11_QUERY_OCCLUSION: {
       uint64_t null_data;
       uint64_t *data_ptr = pData ? (uint64_t *)pData : &null_data;
-      hr = ((IMTLD3DOcclusionQuery *)pAsync)->GetData(data_ptr);
+      hr = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_OCCLUSION_PREDICATE: {
       BOOL null_data;
       BOOL *data_ptr = pData ? (BOOL *)pData : &null_data;
-      hr = ((IMTLD3DOcclusionQuery *)pAsync)->GetData(data_ptr);
+      hr = static_cast<MTLD3D11OcclusionQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_TIMESTAMP: {
-      if (pData)
-        *static_cast<UINT64 *>(pData) = 0;
+      uint64_t null_data;
+      uint64_t *data_ptr = pData ? (uint64_t *)pData : &null_data;
+      hr = static_cast<MTLD3D11TimestampQuery *>(pAsync)->GetData(data_ptr);
       break;
     }
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
@@ -494,10 +507,14 @@ public:
     auto query_list = AllocateCommandData<Rc<VisibilityResultQuery>>(cmdlist->visibility_query_count);
     for (const auto &[query, index] : cmdlist->issued_visibility_query) {
       query_list[index] = new VisibilityResultQuery();
-      query->DoDeferredQuery(query_list[index]);
+      query->DoDeferredQuery(query_list[index].ptr());
     }
 
     for (const auto &query : cmdlist->issued_event_query) {
+      End(query.ptr());
+    }
+
+    for (const auto &query : cmdlist->issued_timestamp_query) {
       End(query.ptr());
     }
 
@@ -587,8 +604,14 @@ public:
     return S_OK;
   }
 
+  UINT
+  STDMETHODCALLTYPE
+  GetContextFlags() override {
+    return 0;
+  }
+
 private:
-  std::vector<Com<IMTLD3DOcclusionQuery>> pending_occlusion_queries;
+  std::vector<Com<MTLD3D11OcclusionQuery>> pending_occlusion_queries;
   CommandQueue &cmd_queue;
   ContextInternalState ctx_state;
   std::atomic<uint32_t> refcount = 0;

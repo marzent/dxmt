@@ -689,7 +689,7 @@ public:
       EmitOP([=, texture = pUAV->texture(), viewId = pUAV->viewId(),
             value = std::array<uint32_t, 4>({Values[0], Values[1], Values[2], Values[3]}),
             dimension = desc.ViewDimension](ArgumentEncodingContext &enc) mutable {
-        auto view_format = texture->view(viewId).pixelFormat();
+        auto view_format = texture->pixelFormat(viewId);
         auto uint_format = MTLGetUnsignedIntegerFormat((WMTPixelFormat)view_format);
         /* RG11B10Float is a special case */
         if (view_format == WMTPixelFormatRG11B10Float) {
@@ -937,7 +937,7 @@ public:
         if (tex->pixelFormat(viewId) == WMTPixelFormatA8Unorm) {
           fixedViewId = tex->checkViewUseFormat(viewId, WMTPixelFormatR8Unorm);
         }
-        WMT::Texture texture = enc.access(tex, fixedViewId, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+        WMT::Texture texture = enc.access(tex, fixedViewId, DXMT_ENCODER_RESOURCE_ACESS_READWRITE).texture;
         if (texture.mipmapLevelCount() > 1) {
           auto &cmd = enc.encodeBlitCommand<wmtcmd_blit_generate_mipmaps>();
           cmd.type = WMTBlitCommandGenerateMipmaps;
@@ -1016,6 +1016,9 @@ public:
   STDMETHODCALLTYPE
   CopyResource(ID3D11Resource *pDstResource, ID3D11Resource *pSrcResource) override {
     std::lock_guard<mutex_t> lock(mutex);
+
+    if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
+      return;
 
     BlitObject Dst(device, pDstResource);
     BlitObject Src(device, pSrcResource);
@@ -1252,6 +1255,7 @@ public:
     }
     EmitOP([Primitive, StartVertexLocation, VertexCount](ArgumentEncodingContext& enc) {
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
       cmd.type = WMTRenderCommandDraw;
       cmd.primitive_type = Primitive;
@@ -1290,6 +1294,7 @@ public:
     EmitOP([IndexType, IndexBufferOffset, Primitive, IndexCount, BaseVertexLocation](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       cmd.type = WMTRenderCommandDrawIndexed;
       cmd.primitive_type = Primitive;
@@ -1327,6 +1332,7 @@ public:
     EmitOP([Primitive, StartVertexLocation, VertexCountPerInstance, InstanceCount,
           StartInstanceLocation](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
       cmd.type = WMTRenderCommandDraw;
       cmd.primitive_type = Primitive;
@@ -1374,6 +1380,7 @@ public:
           IndexCountPerInstance](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed>();
       cmd.type = WMTRenderCommandDrawIndexed;
       cmd.primitive_type = Primitive;
@@ -1394,7 +1401,7 @@ public:
   ) {
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
+    EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_ARGUMENTS>(draw_arguments_offset);
       draw_arugment->StartVertex = StartVertexLocation;
       draw_arugment->VertexCount = VertexCountPerInstance;
@@ -1415,6 +1422,7 @@ public:
       }
 
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
       cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1433,7 +1441,7 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     auto draw_arguments_offset = PreAllocateArgumentBuffer(sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), 32);
     auto max_object_threadgroups = max_object_threadgroups_;
-    EmitOP([=, topo = state_.InputAssembler.Topology](ArgumentEncodingContext &enc) {
+    EmitOP([=](ArgumentEncodingContext &enc) {
       DXMT_DRAW_INDEXED_ARGUMENTS *draw_arugment = enc.getMappedArgumentBuffer<DXMT_DRAW_INDEXED_ARGUMENTS>(draw_arguments_offset);
       draw_arugment->BaseVertex = BaseVertexLocation;
       draw_arugment->IndexCount = IndexCountPerInstance;
@@ -1456,6 +1464,7 @@ public:
 
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1491,6 +1500,7 @@ public:
       }
 
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
       cmd.type = WMTRenderCommandDXMTGeometryDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1526,6 +1536,7 @@ public:
       }
 
       enc.bumpVisibilityResultOffset();
+      enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1560,10 +1571,13 @@ public:
     auto IndexBufferOffset = state_.InputAssembler.IndexBufferOffset;
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
       EmitOP([IndexType, IndexBufferOffset, Primitive, ArgBuffer = bindable->buffer(),
-            AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+              AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         enc.bumpVisibilityResultOffset();
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandDrawIndexedIndirect;
         cmd.primitive_type = Primitive;
@@ -1596,12 +1610,15 @@ public:
     }
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
       EmitOP([Primitive, ArgBuffer = bindable->buffer(), AlignedByteOffsetForArgs](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         enc.bumpVisibilityResultOffset();
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw_indirect>();
         cmd.type = WMTRenderCommandDrawIndirect;
         cmd.primitive_type = Primitive;
-        cmd.indirect_args_buffer = buffer->buffer();;
+        cmd.indirect_args_buffer = buffer->buffer();
         cmd.indirect_args_offset = AlignedByteOffsetForArgs + buffer_offset;
       });
     }
@@ -1614,9 +1631,11 @@ public:
     auto max_object_threadgroups = max_object_threadgroups_;
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
-  
+
         auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
   
         enc.bumpVisibilityResultOffset();
@@ -1624,6 +1643,7 @@ public:
           buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
           dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
         );
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indirect>();
         cmd.type = WMTRenderCommandDXMTGeometryDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -1645,9 +1665,11 @@ public:
 
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
       EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
-  
+
         auto [vertex_per_warp, vertex_increment_per_wrap] = get_gs_vertex_count(topo);
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
   
@@ -1656,6 +1678,7 @@ public:
           buffer->buffer(), buffer->gpuAddress() + buffer_offset, AlignedByteOffsetForArgs, vertex_increment_per_wrap,
           dispatch_arg.gpu_buffer, dispatch_arg.gpu_address, dispatch_arg.offset, max_object_threadgroups
         );
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandDXMTGeometryDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -1676,10 +1699,12 @@ public:
   ) {
     auto max_object_threadgroups = max_object_threadgroups_;
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
-      EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+      EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
-  
+
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
   
@@ -1689,6 +1714,7 @@ public:
             AlignedByteOffsetForArgs, NumControlPoint, PatchPerGroup,
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indirect>();
         cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -1710,10 +1736,12 @@ public:
     auto max_object_threadgroups = max_object_threadgroups_;
 
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
-      EmitOP([=, topo = state_.InputAssembler.Topology, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
-        auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 20, DXMT_ENCODER_RESOURCE_ACESS_READ);
+      EmitOP([=, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
+        auto [buffer, buffer_offset] = enc.access<PipelineStage::Vertex>(
+            ArgBuffer, AlignedByteOffsetForArgs, sizeof(DXMT_DRAW_INDEXED_ARGUMENTS), DXMT_ENCODER_RESOURCE_ACESS_READ
+        );
         auto dispatch_arg = enc.allocateTempBuffer1(sizeof(DXMT_DISPATCH_ARGUMENTS), 4);
-  
+
         auto PatchPerGroup = 32 / enc.tess_threads_per_patch;
         auto ThreadsPerPatch = enc.tess_threads_per_patch;
         auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
@@ -1724,6 +1752,7 @@ public:
             AlignedByteOffsetForArgs, NumControlPoint, PatchPerGroup,
             dispatch_arg.gpu_buffer, dispatch_arg.gpu_address,
             dispatch_arg.offset, max_object_threadgroups);
+        enc.resolveRenderPassBarrier();
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed_indirect>();
         cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect;
         cmd.dispatch_args_buffer = dispatch_arg.gpu_buffer;
@@ -1755,6 +1784,7 @@ public:
     if (!PreDispatch())
       return;
     EmitOP([ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ](ArgumentEncodingContext &enc) {
+      enc.resolveComputePassBarrier();
       auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_dispatch>();
       cmd.type = WMTComputeCommandDispatch;
       cmd.size = {ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ};
@@ -1771,6 +1801,7 @@ public:
     if (auto bindable = reinterpret_cast<D3D11ResourceCommon *>(pBufferForArgs)) {
       EmitOP([AlignedByteOffsetForArgs, ArgBuffer = bindable->buffer()](ArgumentEncodingContext &enc) {
         auto [buffer, buffer_offset] = enc.access(ArgBuffer, AlignedByteOffsetForArgs, 12, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        enc.resolveComputePassBarrier();
         auto &cmd = enc.encodeComputeCommand<wmtcmd_compute_dispatch_indirect>();
         cmd.type = WMTComputeCommandDispatchIndirect;
         cmd.indirect_args_buffer = buffer->buffer();;
@@ -1881,8 +1912,9 @@ public:
   IASetIndexBuffer(ID3D11Buffer *pIndexBuffer, DXGI_FORMAT Format, UINT Offset) override {
     std::lock_guard<mutex_t> lock(mutex);
 
-    if (auto expected = reinterpret_cast<D3D11ResourceCommon *>(pIndexBuffer)) {
-      state_.InputAssembler.IndexBuffer = expected;
+    auto pBuffer = reinterpret_cast<D3D11ResourceCommon *>(pIndexBuffer);
+    if (pBuffer && (pBuffer->bindFlags() & D3D11_BIND_INDEX_BUFFER) && ValidateIAHazard(pBuffer)) {
+      state_.InputAssembler.IndexBuffer = pBuffer;
       EmitST([buffer = state_.InputAssembler.IndexBuffer->buffer()](ArgumentEncodingContext &enc) mutable {
         enc.bindIndexBuffer(forward_rc(buffer));
       });
@@ -2143,17 +2175,40 @@ public:
     GetSamplers<PipelineStage::Geometry>(StartSlot, NumSamplers, ppSamplers);
   }
 
+  bool
+  ValidateMultiSOTargets(UINT NumBuffers, ID3D11Buffer *const *ppSOTargets) {
+    for (unsigned i = 0; i < NumBuffers; i++) {
+      if (auto buffer = ppSOTargets[i]) {
+        for (unsigned j = 0; j < i; j++) {
+          if (buffer == ppSOTargets[j])
+            return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  template <typename TView>
+  void
+  SOResolveSRVHazard(TView *pOutputView) {
+    // well, they do the same thing
+    OMResolveSRVHazard<TView>(pOutputView);
+  }
+
   void
   STDMETHODCALLTYPE
   SOSetTargets(UINT NumBuffers, ID3D11Buffer *const *ppSOTargets, const UINT *pOffsets) override {
     std::lock_guard<mutex_t> lock(mutex);
 
+    if (!ValidateMultiSOTargets(NumBuffers, ppSOTargets))
+      return;
+
     if (NumBuffers == 0) {
       NumBuffers = 4; // see msdn description of SOSetTargets
     }
     for (unsigned slot = 0; slot < NumBuffers; slot++) {
-      auto pBuffer = ppSOTargets ? ppSOTargets[slot] : nullptr;
-      if (pBuffer) {
+      auto pBuffer = ppSOTargets ? reinterpret_cast<D3D11ResourceCommon *>(ppSOTargets[slot]) : nullptr;
+      if (pBuffer && (pBuffer->bindFlags() & D3D11_BIND_STREAM_OUTPUT)) {
         bool replaced = false;
         auto &entry = state_.StreamOutput.Targets.bind(slot, {pBuffer}, replaced);
         if (!replaced) {
@@ -2164,8 +2219,17 @@ public:
           }
           continue;
         }
-        entry.Buffer = reinterpret_cast<D3D11ResourceCommon *>(pBuffer);
+        entry.Buffer = pBuffer;
         entry.Offset = pOffsets ? pOffsets[slot] : 0;
+        SOResolveSRVHazard(pBuffer);
+        ResolveIAHazard(pBuffer);
+        /**
+         * We should also unbind output of hazard, but
+         * - `ValidateMultiSOTargets` checks all SO hazard-free
+         * - UAV resource cannot be SO at the same time
+         * - DSV can't even be a buffer
+         * - RTV is questionable: we don't support buffer-backed RTV at the moment
+         */
       } else {
         state_.StreamOutput.Targets.unbind(slot);
       }
@@ -2374,7 +2438,57 @@ public:
   ) override {
     std::lock_guard<mutex_t> lock(mutex);
 
-    SetUnorderedAccessView<PipelineStage::Compute>(StartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+    if (StartSlot + NumUAVs > D3D11_1_UAV_SLOT_COUNT)
+      return;
+    if (!ValidateMultiOutput(0, nullptr, NumUAVs, ppUnorderedAccessViews))
+      return;
+
+    auto &UAVs = state_.ComputeStageUAV.UAVs;
+
+    for (const auto &[Slot, Bound] : UAVs) {
+      if (Slot >= StartSlot && Slot < (StartSlot + NumUAVs))
+        continue;
+      for (uint32_t i = 0; i < NumUAVs; i++) {
+        auto pUAV = static_cast<D3D11UnorderedAccessView *>(ppUnorderedAccessViews[i]);
+        if (CheckOverlap(Bound.View.ptr(), pUAV) && UAVs.unbind(Slot)) {
+          EmitST([=](ArgumentEncodingContext &enc) {
+            enc.bindOutputBuffer<PipelineStage::Compute>(Slot, {}, 0, {}, {});
+          });
+        }
+      }
+    }
+
+    for (unsigned Slot = StartSlot; Slot < StartSlot + NumUAVs; Slot++) {
+      auto pUAV = static_cast<D3D11UnorderedAccessView *>(ppUnorderedAccessViews[Slot - StartSlot]);
+      auto InitialCount = pUAVInitialCounts ? pUAVInitialCounts[Slot - StartSlot] : ~0u;
+      if (pUAV) {
+        bool replaced = false;
+        auto &entry = UAVs.bind(Slot, {pUAV}, replaced);
+        if (InitialCount != ~0u) {
+          UpdateUAVCounter(pUAV, InitialCount);
+        }
+        if (!replaced)
+          continue;
+        entry.View = pUAV;
+        if (auto buffer = pUAV->buffer()) {
+          EmitST([=, buffer = std::move(buffer), viewId = pUAV->viewId(), counter = pUAV->counter(),
+                  slice = pUAV->bufferSlice()](ArgumentEncodingContext &enc) mutable {
+            enc.bindOutputBuffer<PipelineStage::Compute>(Slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
+          });
+        } else {
+          EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
+            enc.bindOutputTexture<PipelineStage::Compute>(Slot, forward_rc(texture), viewId);
+          });
+        }
+        ResolveSRVHazard<PipelineStage::Compute>(pUAV);
+      } else {
+        if (UAVs.unbind(Slot)) {
+          EmitST([=](ArgumentEncodingContext &enc) {
+            enc.bindOutputBuffer<PipelineStage::Compute>(Slot, {}, 0, {}, {});
+          });
+        }
+      }
+    }
   }
 
   void
@@ -2458,7 +2572,7 @@ public:
       UINT NumViews, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView
   ) override {
     OMSetRenderTargetsAndUnorderedAccessViews(
-        NumViews, ppRenderTargetViews, pDepthStencilView, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, NULL, NULL
+        NumViews, ppRenderTargetViews, pDepthStencilView, NumViews, 0, NULL, NULL
     );
   }
 
@@ -2474,7 +2588,7 @@ public:
   ValidateSetRenderTargets(
       UINT NumRTVs, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView
   ) {
-    MTL_RENDER_PASS_ATTACHMENT_DESC *ref = nullptr;
+    const MTL_RENDER_PASS_ATTACHMENT_DESC *ref = nullptr;
 
     auto dsv = static_cast<D3D11DepthStencilView *>(pDepthStencilView);
     UINT render_target_array_length = 0, sample_count = 1, width = 0, height = 0;
@@ -2525,6 +2639,134 @@ public:
     return true;
   };
 
+  bool
+  ValidateMultiOutput(
+      UINT NumRTVs, ID3D11RenderTargetView *const *ppRTVs, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUAVs
+  ) {
+    if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+      NumRTVs = 0;
+    if (NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
+      NumUAVs = 0;
+
+    for (unsigned i = 0; i < NumRTVs; i++) {
+      if (auto pRTV = static_cast<D3D11RenderTargetView *>(ppRTVs[i])) {
+        for (unsigned j = 0; j < i; j++) {
+          if (CheckOverlap(pRTV, static_cast<D3D11RenderTargetView *>(ppRTVs[j])))
+            return false;
+        }
+        if (pRTV->bindFlags() & D3D11_BIND_UNORDERED_ACCESS) {
+          for (uint32_t j = 0; j < NumUAVs; j++) {
+            if (CheckOverlap(pRTV, static_cast<D3D11UnorderedAccessView *>(ppUAVs[j])))
+              return false;
+          }
+        }
+      }
+    }
+
+    for (unsigned i = 0; i < NumUAVs; i++) {
+      if (auto pUAV = static_cast<D3D11UnorderedAccessView *>(ppUAVs[i])) {
+        for (uint32_t j = 0; j < i; j++) {
+          if (CheckOverlap(pUAV, static_cast<D3D11UnorderedAccessView *>(ppUAVs[j])))
+            return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  /**
+  Resolve hazards when OM UAV is updated while RTV is kept
+  Unbound RTV if a subresource conflict
+  No DSV check as DSV^UAV = 1
+  */
+  bool
+  OMResolveRTVHazard(D3D11UnorderedAccessView *pUAV) {
+    if (!pUAV || (pUAV->bindFlags() & D3D11_BIND_RENDER_TARGET) == 0)
+      return false;
+
+    bool hazard = false;
+
+    for (unsigned slot = 0; slot < state_.OutputMerger.NumRTVs; slot++) {
+      if (CheckOverlap(state_.OutputMerger.RTVs[slot].ptr(), pUAV)) {
+        state_.OutputMerger.RTVs[slot] = nullptr;
+        hazard = true;
+      }
+    }
+
+    return hazard;
+  }
+
+  template <PipelineStage Stage, typename TViewOrBuffer>
+  bool
+  ResolveSRVHazard(TViewOrBuffer *pViewOrBuffer) {
+    if (!pViewOrBuffer || (pViewOrBuffer->bindFlags() & D3D11_BIND_SHADER_RESOURCE) == 0)
+      return false;
+
+    bool hazard = false;
+
+    auto &SRVs = state_.ShaderStages[Stage].SRVs;
+
+    for (auto it = SRVs.hazard_begin(); it != SRVs.hazard_end(); it++) {
+      const auto & [Slot, Bound] = *it;
+      if (CheckOverlap(Bound.SRV.ptr(), pViewOrBuffer)) {
+        if (SRVs.unbind(Slot)) {
+          EmitST([=](ArgumentEncodingContext& enc) {
+            enc.bindBuffer<Stage>(Slot, {}, 0, {});
+          });
+        }
+        hazard = true;
+      }
+    }
+
+    return hazard;
+  }
+
+  template <typename TViewOrBuffer>
+  bool
+  ResolveIAHazard(TViewOrBuffer *pViewOrBuffer) {
+    if (!pViewOrBuffer)
+      return false;
+
+    bool hazard = false;
+
+    if (pViewOrBuffer->bindFlags() & D3D11_BIND_INDEX_BUFFER) {
+      if (CheckOverlap(state_.InputAssembler.IndexBuffer.ptr(), pViewOrBuffer)) {
+        state_.InputAssembler.IndexBuffer = nullptr;
+        state_.InputAssembler.IndexBufferFormat = DXGI_FORMAT_UNKNOWN;
+        state_.InputAssembler.IndexBufferOffset = 0;
+        EmitST([](ArgumentEncodingContext &enc) { enc.bindIndexBuffer({}); });
+        hazard = true;
+      }
+    }
+
+    if (pViewOrBuffer->bindFlags() & D3D11_BIND_VERTEX_BUFFER) {
+      for (auto it = state_.InputAssembler.VertexBuffers.hazard_begin();
+           it != state_.InputAssembler.VertexBuffers.hazard_end(); it++) {
+        const auto &[Slot, Bound] = *it;
+        if (CheckOverlap(Bound.Buffer.ptr(), pViewOrBuffer)) {
+          if (state_.InputAssembler.VertexBuffers.unbind(Slot)) {
+            EmitST([=](ArgumentEncodingContext &enc) { enc.bindVertexBuffer(Slot, 0, 0, {}); });
+          }
+          hazard = true;
+        }
+      }
+    }
+
+    return hazard;
+  }
+
+  template <typename TView>
+  void
+  OMResolveSRVHazard(TView *pOutputView) {
+    // FIXME: should compute stage be resolved?
+    ResolveSRVHazard<PipelineStage::Vertex>(pOutputView);
+    ResolveSRVHazard<PipelineStage::Domain>(pOutputView);
+    ResolveSRVHazard<PipelineStage::Hull>(pOutputView);
+    ResolveSRVHazard<PipelineStage::Geometry>(pOutputView);
+    ResolveSRVHazard<PipelineStage::Pixel>(pOutputView);
+  }
+
   void
   STDMETHODCALLTYPE
   OMSetRenderTargetsAndUnorderedAccessViews(
@@ -2534,6 +2776,8 @@ public:
   ) override {
     std::lock_guard<mutex_t> lock(mutex);
 
+    if (!ValidateMultiOutput(NumRTVs, ppRenderTargetViews, NumUAVs, ppUnorderedAccessViews))
+      return;
 
     bool should_invalidate_pass = false;
 
@@ -2551,6 +2795,7 @@ public:
             continue;
           BoundRTVs[rtv_index] = rtv;
           should_invalidate_pass = true;
+          OMResolveSRVHazard(rtv);
         } else {
           if (BoundRTVs[rtv_index]) {
             should_invalidate_pass = true;
@@ -2564,6 +2809,7 @@ public:
         if (state_.OutputMerger.DSV.ptr() != dsv) {
           state_.OutputMerger.DSV = dsv;
           should_invalidate_pass = true;
+          OMResolveSRVHazard(dsv);
         }
       } else {
         if (state_.OutputMerger.DSV) {
@@ -2574,7 +2820,53 @@ public:
     }
 
     if (NumUAVs != D3D11_KEEP_UNORDERED_ACCESS_VIEWS) {
-      SetUnorderedAccessView<PipelineStage::Pixel>(UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+      auto MinUAV = NumUAVs ? UAVStartSlot : D3D11_1_UAV_SLOT_COUNT;
+      auto MaxUAV = NumUAVs ? UAVStartSlot + NumUAVs : 0u;
+      auto OldMinUAV = std::exchange(state_.OutputMerger.MinUAVBinding, MinUAV);
+      auto OldMaxUAV = std::exchange(state_.OutputMerger.MaxUAVBinding, MaxUAV);
+      auto &UAVs = state_.OutputMerger.UAVs;
+      for (unsigned Slot = std::min(MinUAV, OldMinUAV); Slot < std::max(MaxUAV, OldMaxUAV); Slot++) {
+        D3D11UnorderedAccessView *pUAV = nullptr;
+        UINT InitialCount = ~0u;
+        if (Slot >= UAVStartSlot && Slot < UAVStartSlot + NumUAVs) {
+          pUAV = static_cast<D3D11UnorderedAccessView *>(ppUnorderedAccessViews[Slot - UAVStartSlot]);
+          InitialCount = pUAVInitialCounts ? pUAVInitialCounts[Slot - UAVStartSlot] : ~0u;
+        }
+        if (pUAV) {
+          bool replaced = false;
+          auto &entry = UAVs.bind(Slot, {pUAV}, replaced);
+          if (InitialCount != ~0u) {
+            UpdateUAVCounter(pUAV, InitialCount);
+          }
+          if (!replaced)
+            continue;
+          entry.View = pUAV;
+          if (auto buffer = pUAV->buffer()) {
+            EmitST([=, buffer = std::move(buffer), viewId = pUAV->viewId(), counter = pUAV->counter(),
+                    slice = pUAV->bufferSlice()](ArgumentEncodingContext &enc) mutable {
+              enc.bindOutputBuffer<PipelineStage::Pixel>(Slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
+            });
+          } else {
+            EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
+              enc.bindOutputTexture<PipelineStage::Pixel>(Slot, forward_rc(texture), viewId);
+            });
+          }
+
+          OMResolveSRVHazard(pUAV);
+          ResolveIAHazard(pUAV);
+        } else {
+          if (UAVs.unbind(Slot)) {
+            EmitST([=](ArgumentEncodingContext &enc) {
+              enc.bindOutputBuffer<PipelineStage::Pixel>(Slot, {}, 0, {}, {});
+            });
+          }
+        }
+
+        // No check on SO as SO^UAV = 1
+
+        if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+          should_invalidate_pass |= OMResolveRTVHazard(pUAV);
+      }
     }
 
     if (should_invalidate_pass) {
@@ -2713,11 +3005,10 @@ public:
 
     if (pRasterizerState) {
       if (auto expected = com_cast<IMTLD3D11RasterizerState>(pRasterizerState)) {
+        if (state_.Rasterizer.RasterizerState == expected.ptr())
+          return;
         auto current_rs =
             state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState : default_rasterizer_state;
-        if (current_rs == expected.ptr()) {
-          return;
-        }
         if (current_rs->IsScissorEnabled() != expected->IsScissorEnabled()) {
           dirty_state.set(DirtyState::Scissors);
         }
@@ -2890,16 +3181,6 @@ public:
 
 #pragma endregion
 
-#pragma region Misc
-
-  UINT
-  STDMETHODCALLTYPE
-  GetContextFlags() override {
-    return 0;
-  }
-
-#pragma endregion
-
 #pragma region 11.3
 
   void STDMETHODCALLTYPE
@@ -2959,8 +3240,8 @@ public:
     bool dirty_cbuffer = ShaderStage.ConstantBuffers.any_dirty_masked(reflection->ConstantBufferSlotMask);
     bool dirty_sampler = ShaderStage.Samplers.any_dirty_masked(reflection->SamplerSlotMask);
     bool dirty_srv = ShaderStage.SRVs.any_dirty_masked(reflection->SRVSlotMaskHi, reflection->SRVSlotMaskLo);
-    bool dirty_uav = UAVBindingSet.any_dirty_masked(reflection->UAVSlotMask);
-    if (!dirty_cbuffer && !dirty_sampler && !dirty_srv && !dirty_uav)
+    bool uav_bound = UAVBindingSet.any_bound_masked(reflection->UAVSlotMask);
+    if (!dirty_cbuffer && !dirty_sampler && !dirty_srv && !uav_bound)
       return;
 
     if (reflection->NumConstantBuffers && dirty_cbuffer) {
@@ -2972,7 +3253,7 @@ public:
       ShaderStage.ConstantBuffers.clear_dirty();
     }
 
-    if (reflection->NumArguments && (dirty_sampler || dirty_srv || dirty_uav)) {
+    if (reflection->NumArguments && (dirty_sampler || dirty_srv || uav_bound)) {
       auto ArgumentTableQwords = reflection->ArgumentTableQwords;
       auto offset = PreAllocateArgumentBuffer(ArgumentTableQwords << 3, 32);
       EmitST([=, arg = managed_shader->arguments_info()](ArgumentEncodingContext &enc) {
@@ -3183,6 +3464,55 @@ public:
   }
 
   template <PipelineStage Stage>
+  bool
+  ValidateSRVHazard(D3D11ShaderResourceView *pView) {
+    if (pView->hazardsFree())
+      return true;
+
+    /**
+    At the moment, Graphics and Compute handles hazard tracking separately
+    This might be not enough per D3D11 spec
+    */
+
+    if constexpr (Stage == PipelineStage::Compute) {
+      for (const auto &[Slot, Bound] : state_.ComputeStageUAV.UAVs) {
+        if (CheckOverlap(Bound.View.ptr(), pView))
+          return false;
+      }
+      return true;
+    } else {
+      // RTV
+      for (unsigned Slot = 0; Slot < state_.OutputMerger.NumRTVs; Slot++) {
+        if (state_.OutputMerger.RTVs[Slot] && CheckOverlap(state_.OutputMerger.RTVs[Slot].ptr(), pView))
+          return false;
+      }
+
+      // DSV
+      if (state_.OutputMerger.DSV && CheckOverlap(state_.OutputMerger.DSV.ptr(), pView))
+        return false;
+
+      if (pView->bindFlags() & D3D11_BIND_UNORDERED_ACCESS) {
+        // UAV
+        for (unsigned Slot = state_.OutputMerger.NumRTVs; Slot < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; Slot++) {
+          if (state_.OutputMerger.UAVs.test_bound(Slot) &&
+              CheckOverlap(state_.OutputMerger.UAVs[Slot].View.ptr(), pView)) {
+            return false;
+          }
+        }
+      } else if (pView->bindFlags() & D3D11_BIND_STREAM_OUTPUT) {
+        // SO
+        for (unsigned Slot = 0; Slot < 4; Slot++) {
+          if (state_.StreamOutput.Targets.test_bound(Slot) &&
+              CheckOverlap(state_.StreamOutput.Targets[Slot].Buffer.ptr(), pView))
+            return false;
+        }
+      }
+
+      return true;
+    }
+  }
+
+  template <PipelineStage Stage>
   void
   SetShaderResource(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews) {
     std::lock_guard<mutex_t> lock(mutex);
@@ -3191,9 +3521,9 @@ public:
     auto &ShaderStage = state_.ShaderStages[Stage];
     for (unsigned slot = StartSlot; slot < StartSlot + NumViews; slot++) {
       auto pView = static_cast<D3D11ShaderResourceView *>(ppShaderResourceViews[slot - StartSlot]);
-      if (pView) {
+      if (pView && ValidateSRVHazard<Stage>(pView)) {
         bool replaced = false;
-        auto &entry = ShaderStage.SRVs.bind(slot, {pView}, replaced);
+        auto &entry = ShaderStage.SRVs.bind(slot, {pView}, replaced, !pView->hazardsFree());
         if (!replaced)
           continue;
         entry.SRV = pView;
@@ -3243,20 +3573,16 @@ public:
 
     auto &ShaderStage = state_.ShaderStages[Stage];
     for (unsigned Slot = StartSlot; Slot < StartSlot + NumSamplers; Slot++) {
-      auto pSampler = ppSamplers[Slot - StartSlot];
+      auto pSampler = static_cast<D3D11SamplerState *>(ppSamplers[Slot - StartSlot]);
       if (pSampler) {
         bool replaced = false;
         auto &entry = ShaderStage.Samplers.bind(Slot, {pSampler}, replaced);
         if (!replaced)
           continue;
-        if (auto expected = static_cast<D3D11SamplerState *>(pSampler)) {
-          entry.Sampler = expected;
-          EmitST([=, sampler = entry.Sampler->sampler()](ArgumentEncodingContext &enc) mutable {
-            enc.bindSampler<Stage>(Slot, forward_rc(sampler));
-          });
-        } else {
-          D3D11_ASSERT(0 && "wtf");
-        }
+        entry.Sampler = pSampler;
+        EmitST([=, sampler = pSampler->sampler()](ArgumentEncodingContext &enc) mutable {
+          enc.bindSampler<Stage>(Slot, forward_rc(sampler));
+        });
       } else {
         // BIND NULL
         if (ShaderStage.Samplers.unbind(Slot)) {
@@ -3292,80 +3618,49 @@ public:
         return;
       /* TODO: suballocate uav counter */
       auto new_counter = counter->allocate(BufferAllocationFlag::GpuManaged);
-      int _zero = 0;
-      new_counter->updateContents(0, &_zero, 4);
+      new_counter->updateContents(0, &value, 4);
       new_counter->buffer().didModifyRange(0, 4);
       auto old = counter->rename(std::move(new_counter));
       // TODO: reused discarded buffer
     });
   }
 
-  template <PipelineStage Stage>
-  void
-  SetUnorderedAccessView(
-      UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews,
-      const UINT *pUAVInitialCounts
-  ) {
-    auto &binding_set = Stage == PipelineStage::Compute ? state_.ComputeStageUAV.UAVs : state_.OutputMerger.UAVs;
-
-    // std::erase_if(state_.ComputeStageUAV.UAVs, [&](const auto &item) -> bool
-    // {
-    //   auto &[slot, bound_uav] = item;
-    //   if (slot < StartSlot || slot >= (StartSlot + NumUAVs))
-    //     return false;
-    //   for (auto i = 0u; i < NumUAVs; i++) {
-    //     if (auto uav = static_cast<MTLD3D11UnorderedAccessView *>(
-    //             ppUnorderedAccessViews[i])) {
-    //       // if (bound_uav.View->GetViewRange().CheckOverlap(
-    //       //         uav->GetViewRange())) {
-    //       //   return true;
-    //       // }
-    //     }
-    //   }
-    //   return false;
-    // });
-
-    for (unsigned slot = StartSlot; slot < StartSlot + NumUAVs; slot++) {
-      auto pUAV = static_cast<D3D11UnorderedAccessView*>(ppUnorderedAccessViews[slot - StartSlot]);
-      auto InitialCount = pUAVInitialCounts ? pUAVInitialCounts[slot - StartSlot] : ~0u;
-      if (pUAV) {
-        bool replaced = false;
-        auto &entry = binding_set.bind(slot, {pUAV}, replaced);
-        if (InitialCount != ~0u) {
-          UpdateUAVCounter(pUAV, InitialCount);
-        }
-        if (!replaced) {
-          continue;
-        }
-        entry.View = pUAV;
-        if (auto buffer = pUAV->buffer()) {
-          EmitST([=, buffer = std::move(buffer), viewId = pUAV->viewId(), counter = pUAV->counter(),
-                slice = pUAV->bufferSlice()](ArgumentEncodingContext &enc) mutable {
-            enc.bindOutputBuffer<Stage>(slot, forward_rc(buffer), viewId, forward_rc(counter), slice);
-          });
-        } else {
-          EmitST([=, texture = pUAV->texture(), viewId = pUAV->viewId()](ArgumentEncodingContext &enc) mutable {
-            enc.bindOutputTexture<Stage>(slot, forward_rc(texture), viewId);
-          });
-        }
-        // FIXME: resolve srv hazard: unbind any cs srv that share the resource
-        // std::erase_if(state_.ShaderStages[5].SRVs,
-        //               [&](const auto &item) -> bool {
-        //                 // auto &[slot, bound_srv] = item;
-        //                 // if srv conflict with uav, return true
-        //                 return false;
-        //               });
-      } else {
-        if (binding_set.unbind(slot)) {
-          EmitST([=](ArgumentEncodingContext &enc) { enc.bindOutputBuffer<Stage>(slot, {}, 0, {}, {}); });
-        }
-      }
-    }
-  }
-
 #pragma endregion
 
 #pragma region InputAssembler
+
+  bool
+  ValidateIAHazard(D3D11ResourceCommon *pBuffer) {
+    if (pBuffer->hazardsFree())
+      return true;
+
+    /**
+    At the moment, Graphics and Compute handles hazard tracking separately
+    This might be not enough per D3D11 spec
+
+    RTV and DSV unchecked because they can't be buffer
+    */
+
+    if (pBuffer->bindFlags() & D3D11_BIND_UNORDERED_ACCESS) {
+      // UAV
+      for (unsigned Slot = state_.OutputMerger.MinUAVBinding; Slot < state_.OutputMerger.MaxUAVBinding; Slot++) {
+        if (state_.OutputMerger.UAVs.test_bound(Slot) &&
+            CheckOverlap(state_.OutputMerger.UAVs[Slot].View.ptr(), pBuffer)) {
+          return false;
+        }
+      }
+    } else if (pBuffer->bindFlags() & D3D11_BIND_STREAM_OUTPUT) {
+      // SO
+      for (unsigned Slot = 0; Slot < 4; Slot++) {
+        if (state_.StreamOutput.Targets.test_bound(Slot) &&
+            CheckOverlap(state_.StreamOutput.Targets[Slot].Buffer.ptr(), pBuffer))
+          return false;
+      }
+    }
+
+    return true;
+  }
+
   void
   SetVertexBuffers(
       UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppVertexBuffers, const UINT *pStrides, const UINT *pOffsets
@@ -3374,10 +3669,10 @@ public:
 
     auto &VertexBuffers = state_.InputAssembler.VertexBuffers;
     for (unsigned slot = StartSlot; slot < StartSlot + NumBuffers; slot++) {
-      auto pVertexBuffer = ppVertexBuffers[slot - StartSlot];
-      if (pVertexBuffer) {
+      auto pVertexBuffer = reinterpret_cast<D3D11ResourceCommon *>(ppVertexBuffers[slot - StartSlot]);
+      if (pVertexBuffer && (pVertexBuffer->bindFlags() & D3D11_BIND_VERTEX_BUFFER) && ValidateIAHazard(pVertexBuffer)) {
         bool replaced = false;
-        auto &entry = VertexBuffers.bind(slot, {pVertexBuffer}, replaced);
+        auto &entry = VertexBuffers.bind(slot, {pVertexBuffer}, replaced, !pVertexBuffer->hazardsFree());
         if (!replaced) {
           if (pStrides && pStrides[slot - StartSlot] != entry.Stride) {
             VertexBuffers.set_dirty(slot);
@@ -3405,7 +3700,7 @@ public:
           ERR("SetVertexBuffers: offset is null");
           entry.Stride = 0;
         }
-        entry.Buffer = reinterpret_cast<D3D11ResourceCommon *>(pVertexBuffer);
+        entry.Buffer = pVertexBuffer;
           EmitST([=, buffer = entry.Buffer->buffer(), offset = entry.Offset,
                 stride = entry.Stride](ArgumentEncodingContext &enc) mutable {
             enc.bindVertexBuffer(slot, offset, stride, forward_rc(buffer));
@@ -3908,7 +4203,7 @@ public:
 
       SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
       EmitOP([=, src = std::move(src), dst = std::move(dst), cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
-        auto [src_buffer, src_offset] = enc.access(src, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        auto [src_buffer, src_offset] = enc.access(src, 0, src->length(), DXMT_ENCODER_RESOURCE_ACESS_READ);
         auto texture = enc.access(dst, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
         auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
         cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
@@ -4088,11 +4383,10 @@ public:
       /* Setup RenderCommandEncoder */
       struct RENDER_TARGET_STATE {
         Rc<Texture> Texture;
-        unsigned viewId;
+        uint64_t viewId;
         UINT RenderTargetIndex;
         UINT DepthPlane;
         WMTPixelFormat PixelFormat = WMTPixelFormatInvalid;
-        WMTLoadAction LoadAction{WMTLoadActionLoad};
       };
 
       uint32_t effective_render_target = 0;
@@ -4112,10 +4406,8 @@ public:
       }
       struct DEPTH_STENCIL_STATE {
         Rc<Texture> Texture{};
-        unsigned viewId{};
+        uint64_t viewId{};
         WMTPixelFormat PixelFormat = WMTPixelFormatInvalid;
-        WMTLoadAction DepthLoadAction{WMTLoadActionLoad};
-        WMTLoadAction StencilLoadAction{WMTLoadActionLoad};
         unsigned ReadOnlyFlags{};
       };
       // auto &dsv = state_.OutputMerger.DSV;
@@ -4123,7 +4415,7 @@ public:
       uint32_t render_target_width = state_.OutputMerger.RenderTargetWidth;
       uint32_t render_target_height = state_.OutputMerger.RenderTargetHeight;
       bool uav_only = false;
-      uint32_t uav_only_sample_count = 0;
+      uint32_t sample_count = state_.OutputMerger.SampleCount;
       if (state_.OutputMerger.DSV) {
         dsv_info.Texture = state_.OutputMerger.DSV->texture();
         dsv_info.viewId = state_.OutputMerger.DSV->viewId();
@@ -4140,7 +4432,7 @@ public:
         auto &viewport = state_.Rasterizer.viewports[0];
         render_target_width = viewport.Width;
         render_target_height = viewport.Height;
-        uav_only_sample_count = state->UAVOnlySampleCount();
+        sample_count = state->UAVOnlySampleCount();
         if (!(render_target_width && render_target_height)) {
           ERR("uav only rendering is enabled but viewport is empty");
           return false;
@@ -4152,63 +4444,52 @@ public:
       allocated_encoder_argbuf_size_ = allocated_encoder_argbuf_size.get();
 
       EmitST([rtvs = std::move(rtvs), dsv = std::move(dsv_info), effective_render_target, uav_only,
-            render_target_height, render_target_width, uav_only_sample_count,
+            render_target_height, render_target_width, sample_count,
             render_target_array, encoder_argbuf_size = std::move(allocated_encoder_argbuf_size)](ArgumentEncodingContext &ctx) {
         auto pool = WMT::MakeAutoreleasePool();
         uint32_t dsv_planar_flags = DepthStencilPlanarFlags(dsv.PixelFormat);
-        auto& info = ctx.startRenderPass(dsv_planar_flags, dsv.ReadOnlyFlags, rtvs.size(), *encoder_argbuf_size.get())->info;
+        auto& info = *ctx.startRenderPass(dsv_planar_flags, dsv.ReadOnlyFlags, rtvs.size(), *encoder_argbuf_size.get());
 
         for (auto &rtv : rtvs.span()) {
           if (rtv.PixelFormat == WMTPixelFormatInvalid) {
             continue;
           }
-          auto& colorAttachment = info.colors[rtv.RenderTargetIndex];
-          colorAttachment.texture = rtv.Texture->view(rtv.viewId);
-          colorAttachment.depth_plane = rtv.DepthPlane;
-          colorAttachment.load_action = rtv.LoadAction;
-          colorAttachment.store_action = WMTStoreActionStore;
+          auto &color = info.colors[rtv.RenderTargetIndex];
+          color.attachment =
+              ctx.access<PipelineStage::Pixel>(rtv.Texture, rtv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READWRITE);
+          color.depth_plane = rtv.DepthPlane;
+          color.load_action = WMTLoadActionLoad;
+          color.store_action = WMTStoreActionStore;
+          info.tile_barrier_pso_key.color_formats[rtv.RenderTargetIndex] = rtv.PixelFormat;
         };
 
         if (dsv.Texture.ptr()) {
-          WMT::Texture texture = dsv.Texture->view(dsv.viewId);
+          auto access_flag = DXMT_ENCODER_RESOURCE_ACESS_READ;
           // TODO: ...should know more about store behavior (e.g. DiscardView)
           if (dsv_planar_flags & 1) {
-            auto& depthAttachment = info.depth;
-            depthAttachment.texture = texture;
-            depthAttachment.load_action = dsv.DepthLoadAction;
-            depthAttachment.store_action = WMTStoreActionStore;
+            auto &depth = info.depth;
+            depth.attachment = ctx.access<PipelineStage::Pixel>(dsv.Texture, dsv.viewId, access_flag);
+            depth.load_action = WMTLoadActionLoad;
+            depth.store_action = WMTStoreActionStore;
           }
 
           if (dsv_planar_flags & 2) {
-            auto& stencilAttachment = info.stencil;
-            stencilAttachment.texture = texture;
-            stencilAttachment.load_action = dsv.StencilLoadAction;
-            stencilAttachment.store_action = WMTStoreActionStore;
+            auto &stencil = info.stencil;
+            stencil.attachment = ctx.access<PipelineStage::Pixel>(dsv.Texture, dsv.viewId, access_flag);
+            stencil.load_action = WMTLoadActionLoad;
+            stencil.store_action = WMTStoreActionStore;
           }
         }
         if (effective_render_target == 0) {
           if (uav_only) {
-            info.default_raster_sample_count = uav_only_sample_count;
+            info.default_raster_sample_count = sample_count;
           }
         }
 
         info.render_target_height = render_target_height;
         info.render_target_width = render_target_width;
         info.render_target_array_length = render_target_array;
-
-        for (auto &rtv : rtvs.span()) {
-          if (rtv.PixelFormat == WMTPixelFormatInvalid) {
-            continue;
-          }
-          ctx.access(rtv.Texture, rtv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-        };
-
-        if (dsv.Texture.ptr()) {
-          if ((dsv.ReadOnlyFlags & dsv_planar_flags) == dsv_planar_flags)
-            ctx.access(dsv.Texture, dsv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ);
-          else
-            ctx.access(dsv.Texture, dsv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE);
-        }
+        info.tile_barrier_pso_key.raster_sample_count = sample_count;
       });
     }
 
@@ -4390,6 +4671,7 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
+      render_encoder->last_pso = GraphicsPipeline.PipelineState;
     });
 
     cmdbuf_state = CommandBufferState::TessellationRenderPipelineReady;
@@ -4435,6 +4717,7 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
+      render_encoder->last_pso = GraphicsPipeline.PipelineState;
     });
 
     cmdbuf_state = CommandBufferState::GeometryRenderPipelineReady;
@@ -4490,6 +4773,7 @@ public:
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
+      enc.currentRenderEncoder()->last_pso = GraphicsPipeline.PipelineState;
     });
 
     cmdbuf_state = CommandBufferState::RenderPipelineReady;
@@ -4680,10 +4964,11 @@ public:
       auto &so_slot0 = state_.StreamOutput.Targets[0];
       if (so_slot0.Offset == 0xFFFFFFFF) {
         EmitST([slot0 = so_slot0.Buffer->buffer()](ArgumentEncodingContext &enc) {
-          auto [buffer, buffer_offset] = enc.access(slot0, 0, slot0->length(), DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+          auto [buffer, buffer_offset] =
+              enc.access<PipelineStage::Geometry>(slot0, 0, slot0->length(), DXMT_ENCODER_RESOURCE_ACESS_WRITE);
           auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setbuffer>();
           cmd.type = WMTRenderCommandSetVertexBuffer;
-          cmd.buffer = buffer->buffer();;
+          cmd.buffer = buffer->buffer();
           cmd.offset = buffer_offset;
           cmd.index = 20;
           enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(slot0.ptr(), false, true);
@@ -4691,10 +4976,11 @@ public:
         });
       } else {
         EmitST([slot0 = so_slot0.Buffer->buffer(), offset = so_slot0.Offset](ArgumentEncodingContext &enc) {
-          auto [buffer, buffer_offset] = enc.access(slot0, 0, slot0->length(), DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+          auto [buffer, buffer_offset] =
+              enc.access<PipelineStage::Geometry>(slot0, 0, slot0->length(), DXMT_ENCODER_RESOURCE_ACESS_WRITE);
           auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setbuffer>();
           cmd.type = WMTRenderCommandSetVertexBuffer;
-          cmd.buffer = buffer->buffer();;
+          cmd.buffer = buffer->buffer();
           cmd.offset = offset + buffer_offset;
           cmd.index = 20;
           enc.makeResident<PipelineStage::Vertex, PipelineKind::Ordinary>(slot0.ptr(), false, true);
@@ -4781,7 +5067,7 @@ public:
         });
       }
     }
-    for (const auto &[slot, entry] : state_.OutputMerger.UAVs) {
+    for (const auto &[slot, entry] : state_.ComputeStageUAV.UAVs) {
       auto pUAV = entry.View.ptr();
       if (auto buffer = pUAV->buffer()) {
         EmitST([=, buffer = std::move(buffer), viewId = pUAV->viewId(), counter = pUAV->counter(),
@@ -4874,7 +5160,7 @@ class MTLD3D11ContextExt : public IMTLD3D11ContextExt1 {
     uint32_t input_height;
     uint32_t output_width;
     uint32_t output_height;
-    WMT::Reference<WMT::FXTemporalScaler> scaler;
+    Rc<TemporalScaler> scaler;
     Rc<Texture> mv_downscaled;
   };
 public:
@@ -4932,7 +5218,7 @@ public:
       return;
     }
 
-    WMT::Reference<WMT::FXTemporalScaler> scaler;
+    Rc<TemporalScaler> scaler;
     Rc<Texture> mv_downscaled;
 
     for(CachedTemporalScaler& entry: scaler_cache_) {
@@ -4976,7 +5262,7 @@ public:
       info.input_content_min_scale = 1.0f;
       info.input_content_max_scale =  3.0f;
       info.requires_synchronous_initialization = true;
-      scaler_entry.scaler = ctx_->device->GetMTLDevice().newTemporalScaler(info);
+      scaler_entry.scaler = new TemporalScaler(ctx_->device->GetMTLDevice(), info);
       if (pDesc->MotionVectorInDisplayRes) {
         WMTTextureInfo tex_info;
         tex_info.width = scaler_entry.input_width;
@@ -5132,6 +5418,7 @@ public:
     visibility_query_count = 0;
     issued_visibility_query.clear();
     issued_event_query.clear();
+    issued_timestamp_query.clear();
     list.reset();
     staging_allocator.free_blocks(~0uLL);
     cpu_command_allocator.free_blocks(~0uLL);
@@ -5213,8 +5500,9 @@ public:
   std::vector<Rc<StagingResource>> read_staging_resources;
   std::vector<Rc<StagingResource>> written_staging_resources;
   uint32_t visibility_query_count = 0;
-  std::vector<std::pair<Com<IMTLD3DOcclusionQuery>, uint32_t>> issued_visibility_query;
+  std::vector<std::pair<Com<MTLD3D11OcclusionQuery>, uint32_t>> issued_visibility_query;
   std::vector<Com<MTLD3D11EventQuery>> issued_event_query;
+  std::vector<Com<MTLD3D11TimestampQuery>> issued_timestamp_query;
 
 private:
   UINT context_flag;
@@ -5225,7 +5513,6 @@ private:
   RingBumpState<StagingBufferBlockAllocator, kStagingBlockSizeForDeferredContext> staging_allocator;
   RingBumpState<HostBufferBlockAllocator, kStagingBlockSizeForDeferredContext, dxmt::null_mutex> cpu_command_allocator; 
 
-  uint64_t local_coherence = 0;
 };
 
 } // namespace dxmt

@@ -4,10 +4,12 @@
 #include "d3d11_private.h"
 #include "dxgi_interfaces.h"
 #include "dxgi_object.hpp"
+#include "dxgi_output.hpp"
 #include "d3d11_context.hpp"
 #include "dxmt_context.hpp"
 #include "dxmt_hud_state.hpp"
 #include "dxmt_statistics.hpp"
+#include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
 #include "d3d11_device.hpp"
@@ -20,6 +22,7 @@
 #include "wsi_window.hpp"
 #include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
+#include <atomic>
 #include <cfloat>
 #include <format>
 
@@ -62,6 +65,53 @@ WMTColorSpace ConvertColorSpace(DXGI_COLOR_SPACE_TYPE color_space, bool hdr) {
     return WMTColorSpaceInvalid;
   }
 }
+
+/**
+ FIXME: duplicated implementation in dxgi_output.cpp
+*/
+uint32_t
+GetMonitorFormatBpp(DXGI_FORMAT Format) {
+  switch (Format) {
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_B8G8R8X8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+  case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+  case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+    return 32;
+
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    return 64;
+
+  default:
+    Logger::warn(str::format("GetMonitorFormatBpp: Unknown format: ", Format));
+    return 32;
+  }
+}
+
+class ModeSetGuard {
+  std::atomic_flag in_progress_;
+public:
+  class ModeSetInProgress {
+    ModeSetGuard &guard_;
+    bool protected_;
+
+  public:
+    ModeSetInProgress(ModeSetGuard &guard) : guard_(guard) {
+      protected_ = guard_.in_progress_.test_and_set();
+    }
+    ~ModeSetInProgress() {
+      if (!protected_) {
+        guard_.in_progress_.clear();
+      }
+    }
+    operator bool() {
+      return protected_;
+    }
+  };
+};
 
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
@@ -124,6 +174,8 @@ public:
       init_refresh_rate_ = (double)current_mode.refreshRate.numerator /
                            (double)current_mode.refreshRate.denominator;
     }
+
+    handle_alt_tab_ = Config::getInstance().getOption<bool>("dxgi.handleAltTab", false);
 
     hud.initialize(GetVersionDescriptionText(device_->GetDirectXVersion(), device_->GetFeatureLevel()));
 
@@ -234,6 +286,10 @@ public:
   };
 
   HRESULT EnterFullscreenMode(IDXGIOutput1* pTarget) {
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
+
     Com<IDXGIOutput1> output = pTarget;
 
     if (!wsi::isWindow(hWnd))
@@ -245,7 +301,22 @@ public:
         return E_FAIL;
       }
     }
-    
+
+    std::unique_lock<dxmt::mutex> lock(mutex_);
+
+    DXGI_MODE_DESC1 preferred_display_mode = {
+        desc_.Width,
+        desc_.Height,
+        fullscreen_desc_.RefreshRate,
+        desc_.Format,
+        DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
+        DXGI_MODE_SCALING_UNSPECIFIED
+    };
+    if (FAILED(ChangeDisplayMode(output.ptr(), &preferred_display_mode))) {
+      ERR("DXGI: EnterFullscreenMode: Failed to change display mode");
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+    }
+
     // Update swap chain description
     fullscreen_desc_.Windowed = FALSE;
     
@@ -255,19 +326,30 @@ public:
     DXGI_OUTPUT_DESC desc;
     output->GetDesc(&desc);
 
+    monitor_ = desc.Monitor;
+    target_  = std::move(output);
+
+    lock = {};
+
     if (!wsi::enterFullscreenMode(desc.Monitor, hWnd, &window_state_, modeSwitch)) {
       ERR("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    
-    monitor_ = desc.Monitor;
-    target_  = std::move(output);
 
     return S_OK;
   }
   
   
   HRESULT LeaveFullscreenMode() {
+    ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
+    if (modeset_inprogress)
+      return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
+
+    std::lock_guard<dxmt::mutex> lock(mutex_);
+
+    if (FAILED(RestoreDisplayMode(monitor_)))
+      WARN("DXGI: LeaveFullscreenMode: Failed to restore display mode");
+
     // Restore internal state
     fullscreen_desc_.Windowed = TRUE;
     target_  = nullptr;
@@ -281,6 +363,73 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
     
+    presenter->changeGammaRamp(nullptr);
+
+    return S_OK;
+  }
+
+  HRESULT
+  ChangeDisplayMode(IDXGIOutput1 *pOutput, DXGI_MODE_DESC1 *pDisplayMode) {
+    if (!pOutput)
+      return DXGI_ERROR_INVALID_CALL;
+
+    // Find a mode that the output supports
+
+    DXGI_MODE_DESC1 preferred_mode = *pDisplayMode;
+    DXGI_MODE_DESC1 selected_mode = {};
+
+    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
+      preferred_mode.Width = 0;
+      preferred_mode.Height = 0;
+    }
+
+    if (preferred_mode.Format == DXGI_FORMAT_UNKNOWN)
+      preferred_mode.Format = desc_.Format;
+
+    HRESULT hr = pOutput->FindClosestMatchingMode1(&preferred_mode, &selected_mode, nullptr);
+
+    if (FAILED(hr)) {
+      ERR("DXGI: Failed to query closest mode:"
+          "\n"
+          "  Format: ",
+          preferred_mode.Format,
+          "\n"
+          "  Mode:   ",
+          preferred_mode.Width, "x", preferred_mode.Height, "@",
+          preferred_mode.RefreshRate.Numerator / std::max(preferred_mode.RefreshRate.Denominator, 1u));
+      return hr;
+    }
+
+    if (!selected_mode.RefreshRate.Denominator)
+      selected_mode.RefreshRate.Denominator = 1;
+
+    DXGI_OUTPUT_DESC output_desc;
+    pOutput->GetDesc(&output_desc);
+    wsi::WsiMode wsi_mode{
+        selected_mode.Width,
+        selected_mode.Height,
+        {selected_mode.RefreshRate.Numerator, selected_mode.RefreshRate.Denominator},
+        GetMonitorFormatBpp(selected_mode.Format),
+        selected_mode.ScanlineOrdering == DXGI_MODE_SCANLINE_ORDER_UPPER_FIELD_FIRST ||
+            selected_mode.ScanlineOrdering == DXGI_MODE_SCANLINE_ORDER_LOWER_FIELD_FIRST
+    };
+    if (!wsi::setWindowMode(output_desc.Monitor, hWnd, wsi_mode))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+    *pDisplayMode = selected_mode;
+    init_refresh_rate_ = double(selected_mode.RefreshRate.Numerator) / double(selected_mode.RefreshRate.Denominator);
+    return S_OK;
+  }
+
+  HRESULT
+  RestoreDisplayMode(HMONITOR hMonitor) {
+    if (!hMonitor)
+      return DXGI_ERROR_INVALID_CALL;
+
+    if (!wsi::restoreDisplayMode(hMonitor))
+      return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+
+    init_refresh_rate_ = DBL_MAX;
     return S_OK;
   }
 
@@ -288,6 +437,9 @@ public:
   STDMETHODCALLTYPE
   GetFullscreenState(BOOL *pFullscreen, IDXGIOutput **ppTarget) final {
     HRESULT hr = S_OK;
+
+    if (handle_alt_tab_ && !fullscreen_desc_.Windowed && !wsi::isForeground(hWnd))
+      SetFullscreenState(FALSE, nullptr);
 
     if (pFullscreen != nullptr)
       *pFullscreen = !fullscreen_desc_.Windowed;
@@ -375,7 +527,7 @@ public:
       info.output_width = desc_.Width * scale_factor;
       info.color_format = backbuffer_->texture()->pixelFormat();
       info.output_format =upscaled_backbuffer_->texture()->pixelFormat();
-      metalfx_scaler = device_->GetMTLDevice().newSpatialScaler(info);
+      metalfx_scaler = new SpatialScaler(device_->GetMTLDevice(), info);
       D3D11_ASSERT(metalfx_scaler && "otherwise metalfx failed to initialize");
     }
 
@@ -390,6 +542,8 @@ public:
 
     if (!wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
+
+    std::unique_lock<dxmt::mutex> lock(mutex_);
 
     // Promote display mode
     DXGI_MODE_DESC1 newDisplayMode = {};
@@ -411,17 +565,9 @@ public:
       wsi::resizeWindow(hWnd, &window_state_, newDisplayMode.Width,
                         newDisplayMode.Height);
     } else {
-      /* 
-      FIXME: are we ignoring display mode on purpose?
-      */
+      ChangeDisplayMode(target_.ptr(), &newDisplayMode);
+      lock = {};
       wsi::updateFullscreenWindow(monitor_, hWnd, false);
-
-      /* 
-      FIXME: this is not elegant because the size of window is not changed!
-      However some games only invoke ResizeBuffers() on WM_SIZE, which should be actually
-      sent by changing display mode?
-       */
-      SendMessage(hWnd, WM_SIZE, 0, MAKELONG(newDisplayMode.Width, newDisplayMode.Height));
     }
 
     return S_OK;
@@ -492,6 +638,7 @@ public:
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
     DEBUG("DXGISwapChain::GetFrameStatistics: stub");
+    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
     stats->PresentCount = presentation_count_;
     stats->SyncRefreshCount = presentation_count_;
     stats->PresentRefreshCount = presentation_count_;
@@ -506,6 +653,7 @@ public:
     if (last_present_count == NULL) {
       return E_POINTER;
     }
+    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
     *last_present_count = presentation_count_;
     return S_OK;
   };
@@ -583,11 +731,33 @@ public:
   STDMETHODCALLTYPE
   Present1(UINT SyncInterval, UINT PresentFlags,
            const DXGI_PRESENT_PARAMETERS *pPresentParameters) final {
+    if (SyncInterval > 4)
+      return DXGI_ERROR_INVALID_CALL;
+
     HRESULT hr = S_OK;
-    if (desc_.Width == 0 || desc_.Height == 0)
+    bool window_minimized = wsi::isMinimized(hWnd);
+    if ((window_minimized || desc_.Width == 0 || desc_.Height == 0)
+        // MSDN: You will not receive DXGI_STATUS_OCCLUDED if you're using a flip model swap chain.
+        && desc_.SwapEffect <= DXGI_SWAP_EFFECT_SEQUENTIAL)
+      hr = DXGI_STATUS_OCCLUDED;
+    bool should_exit_fs = handle_alt_tab_ // At the moment this is still broken for certain games
+                          && !fullscreen_desc_.Windowed && !window_minimized && !wsi::isForeground(hWnd);
+    if (hr == S_OK && should_exit_fs)
       hr = DXGI_STATUS_OCCLUDED;
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
+
+    if (should_exit_fs)
+      SetFullscreenState(FALSE, nullptr);
+
+    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
+
+    device_context_->PrepareFlush();
+    if (hr == DXGI_STATUS_OCCLUDED) {
+      // flush commands without presenting
+      device_context_->Commit();
+      return hr;
+    }
 
     double vsync_duration =
         std::max(SyncInterval * 1.0 /
@@ -595,16 +765,17 @@ public:
                                                : init_refresh_rate_),
                  preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0);
 
-    std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
-
-    device_context_->PrepareFlush();
     auto &cmd_queue = device_->GetDXMTDevice().queue();
     auto chunk = cmd_queue.CurrentChunk();
     chunk->signal_frame_latency_fence_ = cmd_queue.CurrentFrameSeq();
+    if (target_) {
+      auto output = static_cast<MTLDXGIOutput *>(target_.ptr());
+      presenter->changeGammaRamp(output->GetGammaRamp());
+    }
     if constexpr (EnableMetalFX) {
       chunk->emitcc([
         this, vsync_duration, backbuffer = backbuffer_->texture(),
-        sync_state = SyncFrame(chunk->signal_frame_latency_fence_),
+        sync_state = SyncFrame(++presentation_count_),
         upscaled = upscaled_backbuffer_->texture(),
         scaler = this->metalfx_scaler, state = presenter->synchronizeLayerProperties()
       ](ArgumentEncodingContext &ctx) mutable {
@@ -622,7 +793,7 @@ public:
     } else {
       chunk->emitcc([
         this, vsync_duration, state = presenter->synchronizeLayerProperties(),
-        sync_state = SyncFrame(chunk->signal_frame_latency_fence_),
+        sync_state = SyncFrame(++presentation_count_),
         backbuffer = backbuffer_->texture()
       ](ArgumentEncodingContext &ctx) mutable {
         ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
@@ -635,8 +806,6 @@ public:
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
     cmd_queue.PresentBoundary();
-
-    presentation_count_ += 1;
 
     return hr;
   };
@@ -878,8 +1047,12 @@ private:
   int preferred_max_frame_rate = 0;
   HUDState hud;
   Rc<Presenter> presenter;
+  ModeSetGuard modeset_guard_;
+  dxmt::mutex mutex_;
 
-  std::conditional<EnableMetalFX, WMT::Reference<WMT::FXSpatialScaler>, std::monostate>::type metalfx_scaler;
+  bool handle_alt_tab_;
+
+  std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
   float scale_factor = 1.0;
 };

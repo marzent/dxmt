@@ -5,17 +5,6 @@
 #include "log/log.hpp"
 #include "../d3d10/d3d10_query.hpp"
 
-DEFINE_COM_INTERFACE("a301e56d-d87e-4b69-8440-bd003e285904",
-                     IMTLD3DOcclusionQuery)
-    : public ID3D11Query {
-  virtual HRESULT GetData(void *data) = 0;
-  virtual bool Begin() = 0;
-  virtual bool End() = 0;
-  virtual void DoDeferredQuery(dxmt::Rc<dxmt::VisibilityResultQuery> &deferred_query) = 0;
-
-  virtual dxmt::Rc<dxmt::VisibilityResultQuery> __query() = 0;
-};
-
 namespace dxmt {
 
 template <typename Query>
@@ -164,7 +153,25 @@ private:
   uint64_t should_be_signaled_at = 0;
 };
 
+class MTLD3D11OcclusionQuery : public ID3D11Query {
+public:
+  virtual HRESULT GetData(void *data) = 0;
+  virtual VisibilityResultQuery *Begin() = 0;
+  virtual VisibilityResultQuery *End() = 0;
+  virtual void DoDeferredQuery(VisibilityResultQuery *deferred_query) = 0;
+};
+
 HRESULT CreateOcculusionQuery(MTLD3D11Device *pDevice,
+                              const D3D11_QUERY_DESC *pDesc,
+                              ID3D11Query **ppQuery);
+
+class MTLD3D11TimestampQuery : public ID3D11Query {
+public:
+  virtual HRESULT GetData(void *data) = 0;
+  virtual TimestampQuery *End() = 0;
+};
+
+HRESULT CreateTimestampQuery(MTLD3D11Device *pDevice,
                               const D3D11_QUERY_DESC *pDesc,
                               ID3D11Query **ppQuery);
 

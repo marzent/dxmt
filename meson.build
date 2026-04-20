@@ -7,14 +7,14 @@ project('dxmt', ['c', 'cpp'], version : 'v0.1', meson_version: '>=1.3.0', defaul
 
 fs = import('fs')
 
-dxmt_native = get_option('dxmt_native')
+dxmt_crossbuild = meson.is_cross_build()
 
 cpp = meson.get_compiler('cpp')
 cc = meson.get_compiler('c')
 clang = meson.get_compiler('c', native: true)
 clangpp = meson.get_compiler('cpp', native: true)
 
-cpu_family = target_machine.cpu_family()
+cpu_family = host_machine.cpu_family()
 
 dxmt_include_dirs = [
   './include',
@@ -26,7 +26,7 @@ dxmt_native_include_dirs = [
   './include/native/directx',
 ]
 
-if dxmt_native
+if not dxmt_crossbuild
   dxmt_include_dirs += dxmt_native_include_dirs
 endif
 
@@ -100,7 +100,7 @@ if not fs.is_file('include/native/directx/d3d11.h')
   error('Don\'t forget to clone submodules. `git submodule update --init --recursive`')
 endif
 
-if not dxmt_native
+if dxmt_crossbuild
   res_ext = '.o'
   wrc = find_program('windres')
   wrc_generator = generator(wrc,
@@ -137,11 +137,6 @@ if dxmt_debug
 add_project_arguments('-DDXMT_DEBUG=1', language: 'cpp')
 endif
 
-if dxmt_native
-add_project_arguments('-DDXMT_NATIVE=1', language: 'cpp')
-add_project_arguments('-DDXMT_NATIVE=1', language: 'c')
-endif
-
 add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
 dxmt_version = vcs_tag(
@@ -150,7 +145,7 @@ dxmt_version = vcs_tag(
   output: 'version.h',
 )
 
-if not dxmt_native
+if dxmt_crossbuild
   wine_builtin_dll = get_option('wine_builtin_dll')
 
   if cpu_family == 'x86'
@@ -176,25 +171,35 @@ if not dxmt_native
       windows_native_install_dir = 'system32'
     endif
     windows_builtin_install_dir = 'x86_64-windows'
+  elif cpu_family == 'aarch64'
+    if wine_builtin_dll
+      windows_native_install_dir = 'aarch64-windows'
+    else
+      windows_native_install_dir = 'system32'
+    endif
+    windows_builtin_install_dir = 'aarch64-windows'
   else
     error('invalid cpu family')
   endif
 
-  unix_install_dir = 'x86_64-unix'
+  unix_install_dir = cpu_family + '-unix'
 else
   wine_builtin_dll = false
   windows_native_install_dir = ''
 endif
 
+native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'
+
 add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
 add_project_arguments(clangpp.get_supported_arguments(native_compiler_args), language: 'cpp', native: true)
 add_project_arguments(cc.get_supported_arguments(compiler_args), language: 'c')
+add_project_arguments(clang.get_supported_arguments(native_compiler_args), language: 'c', native: true)
 add_project_link_arguments(cpp.get_supported_link_arguments(link_args), language: 'cpp')
 add_project_link_arguments(cc.get_supported_link_arguments(link_args), language: 'c')
-if not dxmt_native
-  add_project_arguments(['-arch', 'x86_64'], language: 'c',  native: true)
-  add_project_arguments(['-arch', 'x86_64'], language: 'cpp',  native: true)
-  add_project_link_arguments(['-arch', 'x86_64'], language: 'cpp',  native: true)
+if dxmt_crossbuild
+  add_project_arguments(['-arch', native_compiler_arch], language: 'c',  native: true)
+  add_project_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
+  add_project_link_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
 endif
 
 subdir('libs')

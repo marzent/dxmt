@@ -265,11 +265,17 @@ NVAPI_INTERFACE
 NvAPI_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
   if (!nvGPUHandle || !pGpuCount)
     return NVAPI_INVALID_ARGUMENT;
-  /*
-   * reasonable to report one fake gpu handle
-   */
-  *pGpuCount = 1;
-  nvGPUHandle[0] = (NvPhysicalGpuHandle)0xdeadbeef;
+
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  *pGpuCount = adapter_count;
+  for (unsigned i = 0; i < adapter_count; i++) {
+    nvGPUHandle[i] = (NvPhysicalGpuHandle)devices.object(i).registryID();
+  }
+
   return NVAPI_OK;
 }
 
@@ -277,23 +283,41 @@ NVAPI_INTERFACE
 NvAPI_EnumLogicalGPUs(NvLogicalGpuHandle nvGPUHandle[NVAPI_MAX_LOGICAL_GPUS], NvU32 *pGpuCount) {
   if (!nvGPUHandle || !pGpuCount)
     return NVAPI_INVALID_ARGUMENT;
-  /*
-   * reasonable to report one fake gpu handle
-   */
-  *pGpuCount = 1;
-  nvGPUHandle[0] = (NvLogicalGpuHandle)0xdeadbeef;
+
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  *pGpuCount = adapter_count;
+  for (unsigned i = 0; i < adapter_count; i++) {
+    nvGPUHandle[i] = (NvLogicalGpuHandle)devices.object(i).registryID();
+  }
+
   return NVAPI_OK;
 }
 
 NVAPI_INTERFACE
 NvAPI_GetPhysicalGPUsFromDisplay(NvDisplayHandle hNvDisp, NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
-  if (!nvGPUHandle || !pGpuCount)
+  if (!hNvDisp || !nvGPUHandle || !pGpuCount)
     return NVAPI_INVALID_ARGUMENT;
-  /*
-   * reasonable to report one fake gpu handle
-   */
-  *pGpuCount = 1;
-  nvGPUHandle[0] = (NvPhysicalGpuHandle)0xdeadbeef;
+
+  HMONITOR monitor = (HMONITOR)hNvDisp;
+  if (!monitor)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  unsigned count_devices = 0;
+  for (unsigned i = 0; i < adapter_count; i++) {
+    // TODO: Currently assuming all GPU instances are connected to specific monitor
+    nvGPUHandle[count_devices++] = (NvPhysicalGpuHandle)devices.object(i).registryID();
+  }
+  *pGpuCount = count_devices;
+
   return NVAPI_OK;
 }
 
@@ -427,7 +451,6 @@ NvAPI_Disp_HdrColorControl(NvU32 displayId, NV_HDR_COLOR_DATA *pHdrColorData) {
 
 NVAPI_INTERFACE
 NvAPI_EnumNvidiaDisplayHandle(NvU32 thisEnum, NvDisplayHandle *pNvDispHandle) {
-
   if (!pNvDispHandle)
     return NVAPI_INVALID_ARGUMENT;
 
@@ -658,6 +681,14 @@ NvAPI_D3D_GetLatency(IUnknown *pDev, NV_LATENCY_RESULT_PARAMS *pGetLatencyParams
 }
 
 NVAPI_INTERFACE
+NvAPI_D3D_SetVerticalSyncMode(IUnknown *pDev, NVAPI_VSYNC_MODE vsyncMode) {
+  if (!pDev)
+    return NVAPI_INVALID_ARGUMENT;
+
+  return NVAPI_NO_IMPLEMENTATION;
+}
+
+NVAPI_INTERFACE
 NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_PERF_PSTATES20_INFO *pPstatesInfo) {
   if (!hPhysicalGpu || !pPstatesInfo)
     return NVAPI_INVALID_ARGUMENT;
@@ -694,6 +725,74 @@ NvAPI_DRS_CreateSession(NvDRSSessionHandle *phSession) {
 NVAPI_INTERFACE
 NvAPI_DRS_LoadSettings(NvDRSSessionHandle hSession) {
   return NVAPI_NOT_SUPPORTED;
+}
+
+LUID
+GetAdapterLuid(WMT::Device device) {
+  /**
+  TODO: duplicated impl in `dxgi_adapter.cpp`
+  */
+  return std::bit_cast<LUID>(__builtin_bswap64(device.registryID()));
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetAdapterIdFromPhysicalGpu(NvPhysicalGpuHandle hPhysicalGpu, void *pOSAdapterId) {
+  if (!pOSAdapterId)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto registry_id = uint64_t(hPhysicalGpu);
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_INVALID_ARGUMENT;
+
+  WMT::Device target_device{};
+  for (unsigned i = 0; i < adapter_count; i++) {
+    if (registry_id == devices.object(i).registryID()) {
+      target_device = devices.object(i);
+      break;
+    }
+  }
+  if (!target_device)
+    return NVAPI_INVALID_ARGUMENT;
+
+  *reinterpret_cast<LUID *>(pOSAdapterId) = GetAdapterLuid(target_device);
+  return NVAPI_OK;
+}
+
+NVAPI_INTERFACE
+NvAPI_GPU_GetLogicalGpuInfo(NvLogicalGpuHandle hLogicalGpu, NV_LOGICAL_GPU_DATA *pLogicalGpuData) {
+  if (!pLogicalGpuData)
+    return NVAPI_INVALID_ARGUMENT;
+
+  auto registry_id = uint64_t(hLogicalGpu);
+  auto devices = WMT::CopyAllDevices();
+  auto adapter_count = devices.count();
+  if (adapter_count == 0)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  WMT::Device target_device{};
+  for (unsigned i = 0; i < adapter_count; i++) {
+    if (registry_id == devices.object(i).registryID()) {
+      target_device = devices.object(i);
+      break;
+    }
+  }
+  if (!target_device)
+    return NVAPI_NVIDIA_DEVICE_NOT_FOUND;
+
+  switch (pLogicalGpuData->version) {
+  case NV_LOGICAL_GPU_DATA_VER1:
+    pLogicalGpuData->physicalGpuCount = 1;
+    memset(pLogicalGpuData->physicalGpuHandles, 0, sizeof(pLogicalGpuData->physicalGpuHandles));
+    pLogicalGpuData->physicalGpuHandles[0] = (NvPhysicalGpuHandle)registry_id;
+    *reinterpret_cast<LUID *>(pLogicalGpuData->pOSAdapterId) = GetAdapterLuid(target_device);
+    break;
+  default:
+    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  }
+
+  return NVAPI_OK;
 }
 
 extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
@@ -784,6 +883,8 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_D3D_Sleep;
   case 0x1a587f9c:
     return (void *)&NvAPI_D3D_GetLatency;
+  case 0x5526cfd1:
+    return (void *)&NvAPI_D3D_SetVerticalSyncMode;
   case 0xdc6dc8d3:
     return (void *)&NvAPI_Mosaic_GetDisplayViewportsByResolution;
   case 0x348ff8e1:
@@ -794,6 +895,10 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     return (void *)&NvAPI_DRS_CreateSession;
   case 0x375dbd6b:
     return (void *)&NvAPI_DRS_LoadSettings;
+  case 0x0ff07fde:
+    return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
+  case 0x842b066e:
+    return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
   default:
     break;
   }
