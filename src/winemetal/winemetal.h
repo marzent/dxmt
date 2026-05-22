@@ -863,6 +863,14 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandUpdateFence,
   WMTBlitCommandFillBuffer,
   WMTBlitCommandResolveCounters,
+  WMTBlitCommandCopyFromBufferToTextureWithBlitOption,
+};
+
+enum WMTBlitOption : uint16_t {
+  WMTBlitOptionNone = 0,
+  WMTBlitOptionDepthFromDepthStencil = 1,
+  WMTBlitOptionStencilFromDepthStencil = 2,
+  WMTBlitOptionRowLinearPVRTC = 4,
 };
 
 struct wmtcmd_base {
@@ -900,6 +908,22 @@ struct wmtcmd_blit_copy_from_buffer_to_texture {
   obj_handle_t dst;
   uint32_t slice;
   uint32_t level;
+  struct WMTOrigin origin;
+};
+
+struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption {
+  enum WMTBlitCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t src;
+  uint64_t src_offset;
+  uint32_t bytes_per_row;
+  uint32_t bytes_per_image;
+  struct WMTSize size;
+  obj_handle_t dst;
+  uint32_t slice;
+  uint16_t level;
+  uint16_t options;
   struct WMTOrigin origin;
 };
 
@@ -1686,7 +1710,7 @@ enum WMTColorSpace : uint64_t {
 
 WINEMETAL_API bool CGColorSpace_checkColorSpaceSupported(enum WMTColorSpace colorspace);
 
-WINEMETAL_API bool MetalLayer_setColorSpace(obj_handle_t layer, enum WMTColorSpace colorpsace);
+WINEMETAL_API bool MetalLayer_setColorSpace(obj_handle_t layer, enum WMTColorSpace colorspace);
 
 WINEMETAL_API uint32_t WMTGetPrimaryDisplayId();
 

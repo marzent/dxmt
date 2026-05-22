@@ -383,7 +383,15 @@ public:
 
   void
   STDMETHODCALLTYPE
-  ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override{IMPLEMENT_ME}
+  Flush1(D3D11_CONTEXT_TYPE Type, HANDLE hEvent) override {
+    // nop
+  }
+
+  void
+  STDMETHODCALLTYPE
+  ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override{
+    UNIMPLEMENTED("ExecuteCommandList on deferred context");
+  }
 
   HRESULT 
   STDMETHODCALLTYPE

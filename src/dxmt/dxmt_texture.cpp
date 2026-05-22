@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "dxmt_texture.hpp"
 #include "dxmt_residency.hpp"
 #include "wsi_platform.hpp"
@@ -70,23 +88,25 @@ TextureAllocation::TextureAllocation(
   );
 };
 
-TextureAllocation::~TextureAllocation(){
+void
+TextureAllocation::free(){
 #ifdef __i386__
   wsi::aligned_free(mappedMemory);
 #endif
+  delete this;
 };
 
 void
-Texture::prepareAllocationViews(TextureAllocation *allocaiton) {
-  if (allocaiton->version_ < 1) {
-    allocaiton->cached_view_.push_back(new TextureView(allocaiton));
-    allocaiton->version_ = 1;
+Texture::prepareAllocationViews(TextureAllocation *allocation) {
+  if (allocation->version_ < 1) {
+    allocation->cached_view_.push_back(new TextureView(allocation));
+    allocation->version_ = 1;
   }
   std::shared_lock<dxmt::shared_mutex> lock(mutex_);
-  for (unsigned version = allocaiton->version_; version < version_; version++) {
-    allocaiton->cached_view_.push_back(new TextureView(allocaiton, version, viewDescriptors_[version]));
+  for (unsigned version = allocation->version_; version < version_; version++) {
+    allocation->cached_view_.push_back(new TextureView(allocation, version, viewDescriptors_[version]));
   }
-  allocaiton->version_ = version_;
+  allocation->version_ = version_;
 }
 
 TextureViewKey
@@ -190,7 +210,7 @@ Texture::import(mach_port_t mach_port) {
   info.mach_port = mach_port;
   auto texture = device_.newSharedTexture(info);
   // now allocation's info is populated
-  // and we may check if it is consitent with texture's info (it should be)
+  // and we may check if it is consistent with texture's info (it should be)
   if (texture) {
     // doing some unnecessary checks for the sake of completeness
     if (info.options & WMTResourceStorageModeManaged) // should be always false

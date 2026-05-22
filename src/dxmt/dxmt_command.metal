@@ -1,3 +1,22 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ * Copyright 2026 Paweł Kołodziejski
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include <metal_common>
 #include <metal_texture>
 #include <metal_math>
@@ -339,7 +358,7 @@ float3 to_srgb(float3 linear) {
   if (present_with_hdr_metadata) {
     // tone mapping: BT.2408 EETF + maxRGB
     float max_content_luminance = meta.max_content_luminance;
-    float min_content_luminance = 1; // in case of divison by 0
+    float min_content_luminance = 1; // in case of division by 0
     float max_display_luminance = meta.max_display_luminance;
     float min_display_luminance = 0;
     float3 clamped = clamp(output_rgb, float3(min_content_luminance), float3(max_content_luminance));
@@ -365,7 +384,7 @@ struct DXMTDispatchArguments {
 };
 
 struct DXMTTSDispatchMarshal {
-  constant uint2& draw_arguments; // (vertex|index_count, index_count)
+  constant uint2& draw_arguments; // (vertex|index_count, instance_count)
   device DXMTDispatchArguments& dispatch_arguments_out;
   ulong max_object_threadgroups;
   ushort control_point_count;
@@ -384,7 +403,8 @@ struct DXMTTSDispatchMarshal {
 
     uint patch_count_per_instance = task.draw_arguments.x / (uint)task.control_point_count;
     uint x = (patch_count_per_instance - 1) / task.patch_per_group + 1;
-    if (x * task.draw_arguments.y > task.max_object_threadgroups) {
+    if ((task.draw_arguments.x * task.draw_arguments.y) == 0 ||
+        x * task.draw_arguments.y > task.max_object_threadgroups) {
       output.x = 0;
       output.y = 0;
       output.z = 0;
@@ -396,11 +416,12 @@ struct DXMTTSDispatchMarshal {
 
     if (task.end_of_command)
       break;
+    index++;
   };
 }
 
 struct DXMTGSDispatchMarshal {
-  constant uint2& draw_arguments; // (vertex|index_count, index_count)
+  constant uint2& draw_arguments; // (vertex|index_count, instance_count)
   device DXMTDispatchArguments& dispatch_arguments_out;
   ulong max_object_threadgroups;
   uint vertex_count_per_warp;
@@ -417,7 +438,8 @@ struct DXMTGSDispatchMarshal {
     device DXMTDispatchArguments& output = task.dispatch_arguments_out;
 
     uint x = (task.draw_arguments.x - 1) / task.vertex_count_per_warp + 1;
-    if (x * task.draw_arguments.y > task.max_object_threadgroups) {
+    if ((task.draw_arguments.x * task.draw_arguments.y) == 0 ||
+        x * task.draw_arguments.y > task.max_object_threadgroups) {
       output.x = 0;
       output.y = 0;
       output.z = 0;
@@ -429,6 +451,7 @@ struct DXMTGSDispatchMarshal {
 
     if (task.end_of_command)
       break;
+    index++;
   };
 }
 
@@ -492,7 +515,7 @@ struct linear_texture_desc {
   if (width > pos.x && height > pos.y) {
     auto dst = reinterpret_cast<device packed_d32s8x24 *>(buffer + buffer_offset);
     dst->depth = tex_depth.read(pos).x;
-    dst->stencil = tex_stencil.read(pos).y;
+    dst->stencil = tex_stencil.read(pos).x;
   }
 }
 
@@ -510,7 +533,7 @@ struct linear_texture_desc {
   if (width > pos.x && height > pos.y) {
     auto dst = reinterpret_cast<device uint *>(buffer + buffer_offset);
     float depth = tex_depth.read(pos).x;
-    uint stencil = tex_stencil.read(pos).y;
+    uint stencil = tex_stencil.read(pos).x;
     *dst = (uint(0xffffff * clamp(depth, 0.0, 1.0)) & 0xffffff) | (stencil << 24);
   }
 }

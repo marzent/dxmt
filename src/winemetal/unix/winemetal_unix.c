@@ -707,6 +707,21 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
             destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)];
       break;
     }
+    case WMTBlitCommandCopyFromBufferToTextureWithBlitOption: {
+      struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *body =
+          (struct wmtcmd_blit_copy_from_buffer_to_texture_withblitoption *)next;
+      [encoder copyFromBuffer:(id<MTLBuffer>)body->src
+                 sourceOffset:body->src_offset
+            sourceBytesPerRow:body->bytes_per_row
+          sourceBytesPerImage:body->bytes_per_image
+                   sourceSize:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
+                    toTexture:(id<MTLTexture>)body->dst
+             destinationSlice:body->slice
+             destinationLevel:body->level
+            destinationOrigin:MTLOriginMake(body->origin.x, body->origin.y, body->origin.z)
+                      options:(MTLBlitOption)body->options];
+      break;
+    }
     case WMTBlitCommandCopyFromTextureToBuffer: {
       struct wmtcmd_blit_copy_from_texture_to_buffer *body = (struct wmtcmd_blit_copy_from_texture_to_buffer *)next;
       [encoder copyFromTexture:(id<MTLTexture>)body->src
@@ -1800,7 +1815,7 @@ struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 {
 struct SM50_SHADER_IA_INPUT_LAYOUT_DATA32 {
   uint32_t next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
-  enum SM50_INDEX_BUFFER_FORAMT index_buffer_format;
+  enum SM50_INDEX_BUFFER_FORMAT index_buffer_format;
   uint32_t slot_mask;
   uint32_t num_elements;
   uint32_t elements;
@@ -2084,7 +2099,7 @@ _MTLLogContainer_enumerate(void *obj) {
   uint64_t count = 0;
   uint64_t read = 0;
   id *buffer = params->buffer.ptr;
-  for (id _ in (id<MTLLogContainer>)params->enumeratable) {
+  for (id _ in (id<MTLLogContainer>)params->enumerable) {
     if (count >= params->start) {
       if (count < params->start + params->buffer_size) {
         buffer[count - params->start] = _;

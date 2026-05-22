@@ -930,7 +930,7 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
 
-  static const char *QUERYS[] = {
+  static const char *QUERIES[] = {
       "get_width", "get_height", "get_depth", "get_array_size", "get_num_mip_levels", "get_num_samples",
   };
 
@@ -967,7 +967,7 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
   }
 
   std::string FnName = "air.";
-  FnName += QUERYS[Query];
+  FnName += QUERIES[Query];
   FnName += "_";
   FnName += TexInfo.air_symbol_suffix;
 
@@ -1182,6 +1182,9 @@ AIRBuilder::CreateFMA(Value *X, Value *Y, Value *Z) {
   if (X->getType() != Y->getType() || X->getType() != Z->getType()) {
     debug << "invalid operation: fma has unmatched operand types.\n";
     return nullptr; // TODO
+  }
+  if (options.defuseFma) {
+    return builder.CreateFAdd(builder.CreateFMul(X, Y), Z);
   }
   auto &Context = getContext();
   auto Attrs = AttributeList::get(

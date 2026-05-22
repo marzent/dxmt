@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "com/com_pointer.hpp"
 #include "d3d11_device.hpp"
 #include "dxmt_buffer.hpp"
@@ -50,7 +68,7 @@ private:
   public:
     UAVWithCounter(
         const tag_unordered_access_view<>::DESC1 *pDesc, D3D11Buffer *pResource, MTLD3D11Device *pDevice,
-        BufferViewInfo const &info, Rc<Buffer>&& counter
+        BufferViewInfo const &info, Rc<Counter>&& counter
     ) :
         UAVBase(pDesc, pResource, pDevice) {
       buffer_ = pResource->buffer_.ptr();
@@ -74,7 +92,7 @@ public:
     if (pDesc->Usage != D3D11_USAGE_DYNAMIC) {
       if (pInitialData)
         flags.set(BufferAllocationFlag::GpuManaged);
-      else if (pDesc->BindFlags & kD3D11OuputBindFlags)
+      else if (pDesc->BindFlags & kD3D11OutputBindFlags)
         flags.set(BufferAllocationFlag::GpuPrivate);
       else
         flags.set(BufferAllocationFlag::GpuManaged);
@@ -95,7 +113,7 @@ public:
     D3D11_ASSERT(_.ptr() == nullptr);
     structured = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     allow_raw_view = pDesc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-    if (!(desc.BindFlags & kD3D11OuputBindFlags)) {
+    if (!(desc.BindFlags & kD3D11OutputBindFlags)) {
       dynamic_ = new DynamicBuffer(buffer_.ptr(), flags);
     }
   }
@@ -214,7 +232,7 @@ public:
     }
     WMTPixelFormat view_format = WMTPixelFormatInvalid;
     uint32_t offset, size, viewElementOffset, viewElementWidth;
-    Rc<Buffer> counter = {};
+    Rc<Counter> counter = {};
     if (structured) {
       if (finalDesc.Format != DXGI_FORMAT_UNKNOWN) {
         return E_INVALIDARG;
@@ -229,12 +247,7 @@ public:
       viewElementOffset = finalDesc.Buffer.FirstElement * (desc.StructureByteStride >> 2);
       viewElementWidth = finalDesc.Buffer.NumElements * (desc.StructureByteStride >> 2);
       if (finalDesc.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER)) {
-        counter = new dxmt::Buffer(sizeof(uint32_t), m_parent->GetMTLDevice());
-        auto allocation = counter->allocate(BufferAllocationFlag::GpuManaged);
-        const uint32_t initial_counter = 0;
-        allocation->updateContents(0, &initial_counter, sizeof(initial_counter));
-        allocation->buffer().didModifyRange(0, sizeof(initial_counter));
-        counter->rename(std::move(allocation));
+        counter = new Counter();
       }
     } else if (finalDesc.Buffer.Flags & D3D11_BUFFER_UAV_FLAG_RAW) {
       if (!allow_raw_view)

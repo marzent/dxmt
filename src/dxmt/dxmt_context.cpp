@@ -1,3 +1,21 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #include "dxmt_context.hpp"
 #include "Metal.hpp"
 #include "dxmt_command_queue.hpp"
@@ -83,7 +101,7 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
     }
     auto valid_length = buffer->length() > state.offset ? buffer->length() - state.offset : 0;
     auto [buffer_alloc, buffer_offset] =
-        access<PipelineStage::Vertex>(buffer, state.offset, valid_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
+        access<PipelineStage::Vertex>(buffer, state.offset, valid_length, ResourceAccess::Read);
     entries[index].buffer_handle = buffer_alloc->gpuAddress() + buffer_offset + state.offset;
     entries[index].stride = state.stride;
     entries[index++].length = valid_length;
@@ -160,7 +178,7 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
       }
       auto argbuf = cbuf.buffer;
       auto valid_length = argbuf->length() > cbuf.offset ? argbuf->length() - cbuf.offset : 0;
-      auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
+      auto [argbuf_alloc, argbuf_offset] = access<stage>(argbuf, cbuf.offset, valid_length, ResourceAccess::Read);
       encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
       makeResident<stage, kind>(argbuf.ptr());
       break;
@@ -274,7 +292,7 @@ ArgumentEncodingContext::encodeShaderResources(
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (srv.buffer.ptr()) {
-          auto [srv_alloc, offset] = access<stage>(srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, DXMT_ENCODER_RESOURCE_ACESS_READ);
+          auto [srv_alloc, offset] = access<stage>(srv.buffer, srv.slice.byteOffset, srv.slice.byteLength, ResourceAccess::Read);
           encoded_buffer[arg.StructurePtrOffset] = srv_alloc->gpuAddress() + offset + srv.slice.byteOffset;
           encoded_buffer[arg.StructurePtrOffset + 1] = srv.slice.byteLength;
           makeResident<stage, kind>(srv.buffer.ptr());
@@ -285,7 +303,7 @@ ArgumentEncodingContext::encodeShaderResources(
       } else if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE) {
         if (srv.buffer.ptr()) {
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TBUFFER_OFFSET);
-          auto [view, offset] = access<stage>(srv.buffer, srv.viewId, DXMT_ENCODER_RESOURCE_ACESS_READ);
+          auto [view, offset] = access<stage>(srv.buffer, srv.viewId, ResourceAccess::Read);
           encoded_buffer[arg.StructurePtrOffset] = view.gpu_resource_id;
           encoded_buffer[arg.StructurePtrOffset + 1] =
               ((uint64_t)srv.slice.elementCount << 32) | (uint64_t)(srv.slice.firstElement + offset);
@@ -294,7 +312,7 @@ ArgumentEncodingContext::encodeShaderResources(
           assert(arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_MINLOD_CLAMP);
           auto viewIdChecked = srv.texture->checkViewUseArray(srv.viewId, arg.Flags & MTL_SM50_SHADER_ARGUMENT_TEXTURE_ARRAY);
           encoded_buffer[arg.StructurePtrOffset] =
-              access<stage>(srv.texture, viewIdChecked, DXMT_ENCODER_RESOURCE_ACESS_READ).gpuResourceID;
+              access<stage>(srv.texture, viewIdChecked, ResourceAccess::Read).gpuResourceID;
           encoded_buffer[arg.StructurePtrOffset + 1] = TextureMetadata(srv.texture->arrayLength(viewIdChecked), 0);
           makeResident<stage, kind>(srv.texture.ptr(), viewIdChecked);
         } else {
@@ -310,7 +328,7 @@ ArgumentEncodingContext::encodeShaderResources(
     case SM50BindingType::UAV: {
       auto &uav = UAVBindingSet[arg.SM50BindingSlot];
       bool read = (arg.Flags >> 10) & 1, write = (arg.Flags >> 10) & 2;
-      auto access_flags =  (DXMT_ENCODER_RESOURCE_ACESS)((arg.Flags >> 10) & 3);
+      int access_flags =  ((arg.Flags >> 10) & 3) | ResourceAccess::UAV;
 
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_BUFFER) {
         if (uav.buffer.ptr()) {
@@ -343,9 +361,9 @@ ArgumentEncodingContext::encodeShaderResources(
       }
       if (arg.Flags & MTL_SM50_SHADER_ARGUMENT_UAV_COUNTER) {
         if (uav.counter) {
-          auto [counter_alloc, offset] = access<stage>(uav.counter, 0, 4, DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+          auto [counter_alloc, offset] = access<stage>(uav.counter);
           encoded_buffer[arg.StructurePtrOffset + 2] = counter_alloc->gpuAddress() + offset;
-          makeResident<stage, kind>(uav.counter.ptr(), true, true);
+          makeResident<stage, kind>(uav.counter.ptr());
         } else {
           /*
            * potentially cause gpu pagefault, even providing a dummy buffer doesn't improve since the returned
@@ -390,6 +408,11 @@ ArgumentEncodingContext::encodeShaderResources(
   }
 }
 
+CounterAllocation *
+ArgumentEncodingContext::getCounterAllocation(Rc<Counter> const &counter) {
+  return queue_.counter_pool.getCurrentAllocation(counter);
+}
+
 void
 ArgumentEncodingContext::retainAllocation(Allocation* allocation) {
   if (allocation->checkRetained(seq_id_))
@@ -412,7 +435,7 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->height = texture->height();
   encoder_current = encoder_info;
 
-  encoder_info->attachment = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
 
   currentFrameStatistics().clear_pass_count++;
 
@@ -436,7 +459,7 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->height = texture->height();
   encoder_current = encoder_info;
 
-  encoder_info->attachment = access(texture, viewId, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
 
   currentFrameStatistics().clear_pass_count++;
   
@@ -455,8 +478,8 @@ ArgumentEncodingContext::resolveTexture(
   encoder_info->fence_update = {encoder_info->id};
   encoder_current = encoder_info;
 
-  encoder_info->src = access(src, src_view, DXMT_ENCODER_RESOURCE_ACESS_READ);
-  encoder_info->dst = access(dst, dst_view, DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+  encoder_info->src = access(src, src_view, ResourceAccess::Read);
+  encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
 
   endPass();
 };
@@ -474,7 +497,7 @@ ArgumentEncodingContext::present(Rc<Texture> &texture, Rc<Presenter> &presenter,
   encoder_info->metadata = metadata;
 
   encoder_current = encoder_info;
-  encoder_info->backbuffer = access(texture, texture->fullView, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
+  encoder_info->backbuffer = access(texture, texture->fullView, ResourceAccess::Read).texture;
   endPass();
 }
 
@@ -489,8 +512,8 @@ ArgumentEncodingContext::upscale(Rc<Texture> &texture, Rc<Texture> &upscaled, Rc
   encoder_info->scaler = scaler;
 
   encoder_current = encoder_info;
-  encoder_info->backbuffer = access(texture, texture->fullView, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  encoder_info->upscaled = access(upscaled, upscaled->fullView, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  encoder_info->backbuffer = access(texture, texture->fullView, ResourceAccess::Read).texture;
+  encoder_info->upscaled = access(upscaled, upscaled->fullView, ResourceAccess::Write).texture;
   endPass();
 }
 
@@ -509,12 +532,12 @@ ArgumentEncodingContext::upscaleTemporal(
   encoder_info->props = props;
 
   encoder_current = encoder_info;
-  encoder_info->input = access(input, input->fullView, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  encoder_info->depth = access(depth, depth->fullView, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  encoder_info->motion_vector = access(motion_vector, mvViewId, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
-  encoder_info->output = access(output, output->fullView, DXMT_ENCODER_RESOURCE_ACESS_WRITE).texture;
+  encoder_info->input = access(input, input->fullView, ResourceAccess::Read).texture;
+  encoder_info->depth = access(depth, depth->fullView, ResourceAccess::Read).texture;
+  encoder_info->motion_vector = access(motion_vector, mvViewId, ResourceAccess::Read).texture;
+  encoder_info->output = access(output, output->fullView, ResourceAccess::Write).texture;
   if (exposure) {
-    encoder_info->exposure = access(exposure, exposure->fullView, DXMT_ENCODER_RESOURCE_ACESS_READ).texture;
+    encoder_info->exposure = access(exposure, exposure->fullView, ResourceAccess::Read).texture;
   }
   endPass();
 }
@@ -644,12 +667,12 @@ ArgumentEncodingContext::endPass() {
       if (render_encoder->depth.attachment && !(render_encoder->dsv_readonly_flags & 1))
         access<PipelineStage::Pixel>(
             render_encoder->depth.attachment->allocation->descriptor, render_encoder->depth.attachment->key,
-            DXMT_ENCODER_RESOURCE_ACESS_WRITE
+            ResourceAccess::Write
         );
       if (render_encoder->stencil.attachment && !(render_encoder->dsv_readonly_flags & 2))
         access<PipelineStage::Pixel>(
             render_encoder->stencil.attachment->allocation->descriptor, render_encoder->stencil.attachment->key,
-            DXMT_ENCODER_RESOURCE_ACESS_WRITE
+            ResourceAccess::Write
         );
 
       render_encoder->fence_wait_vertex =
@@ -716,7 +739,7 @@ void
 ArgumentEncodingContext::sampleTimestamp(Rc<TimestampQuery> &&query) {
   assert(!encoder_current);
   if (encoder_last && encoder_last->type == EncoderType::SampleTimestamp) {
-    timestamp_state_.coalaseQuery(query.ptr());
+    timestamp_state_.coalesceQuery(query.ptr());
     static_cast<SampleTimestampData *>(encoder_last)->queries.push_back(std::move(query));
     return;
   }
@@ -736,7 +759,7 @@ ArgumentEncodingContext::resolveComputePassBarrier() {
   assert(encoder_current);
   assert(encoder_current->type == EncoderType::Compute);
   auto &barrier_state = encoder_current->barrier_state;
-  if (barrier_state.barrierSet) {
+  if (barrier_state.barrierSet & ~intrapass_barrier_control_bits_) {
     auto &cmd = encodeComputeCommand<wmtcmd_compute_memory_barrier>();
     cmd.type = WMTComputeCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
@@ -749,7 +772,7 @@ ArgumentEncodingContext::resolveRenderPassBarrier() {
   assert(encoder_current);
   assert(encoder_current->type == EncoderType::Render);
   auto &barrier_state = encoder_current->barrier_state;
-  if (barrier_state.barrierPreRasterAfterFragmentSet) {
+  if (barrier_state.barrierPreRasterAfterFragmentSet & ~intrapass_barrier_control_bits_) {
     // TODO(barrier): encoder split
     WARN("A fragment-vertex barrier is omitted");
     barrier_state.barrierSet = 0;
@@ -758,12 +781,12 @@ ArgumentEncodingContext::resolveRenderPassBarrier() {
     barrier_state.barrierPreRasterAfterFragmentSet = 0;
     return;
   }
-  // Indiviual barriers
-  if (barrier_state.barrierSet) {
+  // Individual barriers
+  if (barrier_state.barrierSet & ~intrapass_barrier_control_bits_) {
     tile_barrier_cmd.dispatch();
     barrier_state.barrierSet = 0;
   }
-  if (barrier_state.barrierPreRasterSet) {
+  if (barrier_state.barrierPreRasterSet & ~intrapass_barrier_control_bits_) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
     cmd.type = WMTRenderCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
@@ -771,7 +794,7 @@ ArgumentEncodingContext::resolveRenderPassBarrier() {
     cmd.stages_after = WMTRenderStagePreRaster;
     barrier_state.barrierPreRasterSet = 0;
   }
-  if (barrier_state.barrierFragmentAfterPreRasterSet) {
+  if (barrier_state.barrierFragmentAfterPreRasterSet & ~intrapass_barrier_control_bits_) {
     auto &cmd = encodeRenderCommand<wmtcmd_render_memory_barrier>();
     cmd.type = WMTRenderCommandMemoryBarrier;
     cmd.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;

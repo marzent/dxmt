@@ -1,8 +1,27 @@
+/*
+ * Copyright 2026 Feifan He for CodeWeavers
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
 #pragma once
 
 #include "Metal.hpp"
 #include "dxmt_buffer.hpp"
 #include "dxmt_command.hpp"
+#include "dxmt_counter.hpp"
 #include "dxmt_deptrack.hpp"
 #include "dxmt_occlusion_query.hpp"
 #include "dxmt_presenter.hpp"
@@ -25,6 +44,8 @@ constexpr size_t kCommandChunkCPUHeapSize = 0x400000;
 constexpr size_t kCommandChunkGPUHeapSize = 0x400000;
 constexpr size_t kEncodingContextCPUHeapSize = 0x100000;
 constexpr size_t kEncodingContextCPUHeapLifetime = 600;
+
+constexpr auto kIntrapassControlBitIgnoreUAVWaW = 1ull << 1;
 
 inline std::size_t
 align_forward_adjustment(const void *const ptr, const std::size_t &alignment) noexcept {
@@ -73,7 +94,7 @@ struct UnorderedAccessViewBinding {
   uint64_t viewId;
   Rc<Buffer> buffer;
   Rc<Texture> texture;
-  Rc<Buffer> counter;
+  Rc<Counter> counter;
   BufferSlice slice;
 };
 
@@ -303,23 +324,23 @@ struct AllocatedTempBufferSlice {
 
 class ArgumentEncodingContext {
 private:
-  template <PipelineStage stage> void track(GenericAccessTracker &tracker, bool exclusive);
+  template <PipelineStage stage> void track(GenericAccessTracker &tracker, int flags);
 
 public:
   template <PipelineStage stage>
   void
-  trackBuffer(BufferAllocation *allocation, DXMT_ENCODER_RESOURCE_ACESS flags) {
+  trackBuffer(BufferAllocation *allocation, int flags) {
     retainAllocation(allocation);
     if (allocation->flags().test(BufferAllocationFlag::GpuReadonly))
       return;
     auto &tracker = allocation->fenceTrackers[allocation->currentSuballocation()];
-    track<stage>(tracker, flags & DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+    track<stage>(tracker, flags);
   }
 
 public:
   template<PipelineStage stage = PipelineStage::Compute>
   std::pair<BufferAllocation *, uint64_t>
-  access(Rc<Buffer> const &buffer, unsigned offset, unsigned length, DXMT_ENCODER_RESOURCE_ACESS flags) {
+  access(Rc<Buffer> const &buffer, unsigned offset, unsigned length, int flags) {
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
     return {allocation, allocation->currentSuballocationOffset()};
@@ -327,7 +348,7 @@ public:
 
   template<PipelineStage stage = PipelineStage::Compute>
   std::pair<BufferView const &, uint32_t>
-  access(Rc<Buffer> const &buffer, uint64_t viewId, DXMT_ENCODER_RESOURCE_ACESS flags) {
+  access(Rc<Buffer> const &buffer, uint64_t viewId, int flags) {
     auto allocation = buffer->current();
     trackBuffer<stage>(allocation, flags);
     auto &view = buffer->view_(viewId, allocation);
@@ -336,15 +357,15 @@ public:
 
   template<PipelineStage stage = PipelineStage::Compute>
   WMT::Texture
-  access(Rc<Texture> const &texture, unsigned level, unsigned slice, DXMT_ENCODER_RESOURCE_ACESS flags) {
+  access(Rc<Texture> const &texture, unsigned level, unsigned slice, int flags) {
     auto allocation = texture->current();
     retainAllocation(allocation);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
-        track<stage>(allocation->fenceTrackers[0], flags & DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+        track<stage>(allocation->fenceTrackers[0], flags);
       } else {
         auto &tracker = allocation->fenceTrackers[slice * allocation->descriptor->miplevelCount() + level];
-        track<stage>(tracker, flags & DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+        track<stage>(tracker, flags);
       }
     }
     return allocation->texture();
@@ -352,25 +373,44 @@ public:
 
   template<PipelineStage stage = PipelineStage::Compute>
   TextureView &
-  access(Rc<Texture> const &texture, uint64_t viewId, DXMT_ENCODER_RESOURCE_ACESS flags) {
+  access(Rc<Texture> const &texture, uint64_t viewId, int flags) {
     assert(viewId);
     auto allocation = texture->current();
     retainAllocation(allocation);
     auto &view = texture->view(viewId, allocation);
     if (!allocation->flags().test(TextureAllocationFlag::GpuReadonly)) {
       if (likely(allocation->flags().test(TextureAllocationFlag::ShaderReadonly))) {
-        track<stage>(allocation->fenceTrackers[0], flags & DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+        track<stage>(allocation->fenceTrackers[0], flags);
       } else {
         TextureViewKey view = viewId;
         for (unsigned slice = view.array_start; slice < view.array_end; slice++) {
           for (unsigned level = view.mip_start; level < view.mip_end; level++) {
             auto &tracker = allocation->fenceTrackers[slice * view.mip_count + level];
-            track<stage>(tracker, flags & DXMT_ENCODER_RESOURCE_ACESS_WRITE);
+            track<stage>(tracker, flags);
           }
         }
       }
     }
     return view;
+  }
+
+  CounterAllocation *getCounterAllocation(Rc<Counter> const &counter);
+
+  template <PipelineStage stage = PipelineStage::Compute>
+  std::pair<BufferAllocation *, uint64_t>
+  access(Rc<Counter> const &counter, Rc<Buffer> const &buffer_to_synchronize) {
+    auto allocation = getCounterAllocation(counter);
+    retainAllocation(allocation);
+    trackBuffer<stage>(buffer_to_synchronize->current(), ResourceAccess::All);
+    return {allocation->buffer(), allocation->offset()};
+  }
+
+  template <PipelineStage stage = PipelineStage::Compute>
+  std::pair<BufferAllocation *, uint64_t>
+  access(Rc<Counter> const &counter) {
+    auto allocation = getCounterAllocation(counter);
+    retainAllocation(allocation);
+    return {allocation->buffer(), allocation->offset()};
   }
 
   template <PipelineStage stage>
@@ -420,7 +460,7 @@ public:
   }
 
   template <PipelineStage stage>
-  void bindOutputBuffer(unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Buffer> &&counter, BufferSlice slice);
+  void bindOutputBuffer(unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Counter> &&counter, BufferSlice slice);
 
   template <PipelineStage stage> void bindOutputTexture(unsigned slot, Rc<Texture> &&texture, uint64_t viewId);
 
@@ -450,8 +490,7 @@ public:
   std::pair<WMT::Buffer, uint64_t>
   currentIndexBuffer() {
     // because of indirect draw, we can't predicate the accessed buffer range
-    auto [ibuf_alloc, offset] =
-        access<PipelineStage::Vertex>(ibuf_, 0, ibuf_->length(), DXMT_ENCODER_RESOURCE_ACESS_READ);
+    auto [ibuf_alloc, offset] = access<PipelineStage::Vertex>(ibuf_, 0, ibuf_->length(), ResourceAccess::Read);
     return {ibuf_alloc->buffer(), offset};
   };
 
@@ -495,7 +534,16 @@ public:
       cmd.stages = GetStagesFromResidencyMask(requested);
     }
   }
-
+  template <PipelineStage stage, PipelineKind kind>
+  void
+  makeResident(Counter *counter) {
+    auto allocation = getCounterAllocation(counter)->buffer();
+    uint64_t encoder_id = currentEncoder()->id;
+    DXMT_RESOURCE_RESIDENCY requested = GetResidencyMask<kind>(stage, true, true);
+    if (CheckResourceResidency(allocation->residencyState, encoder_id, requested)) {
+      makeResident<stage, kind>(allocation->buffer(), requested);
+    };
+  }
   template <PipelineStage stage, PipelineKind kind>
   void
   makeResident(Buffer *buffer, bool read = true, bool write = false) {
@@ -674,10 +722,10 @@ public:
   getMappedArgumentBuffer(size_t offset) {
     if constexpr (ComputeCommandEncoder)
       return reinterpret_cast<T *>(
-          (char *)reinterpret_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
+          (char *)static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
       );
     return reinterpret_cast<T *>(
-        (char *)reinterpret_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
+        (char *)static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_mapping + offset
     );
   }
 
@@ -685,16 +733,16 @@ public:
   uint64_t
   getFinalArgumentBufferOffset(size_t offset) {
     if constexpr (ComputeCommandEncoder)
-      return reinterpret_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
-    return reinterpret_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
+      return static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
+    return static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_offset + offset;
   }
 
   template <bool ComputeCommandEncoder = false>
   WMT::Buffer
   getFinalArgumentBuffer() {
     if constexpr (ComputeCommandEncoder)
-      return reinterpret_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf;
-    return reinterpret_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf;
+      return static_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf;
+    return static_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf;
   }
 
   std::pair<WMT::Buffer , size_t> allocateTempBuffer(size_t size, size_t alignment);
@@ -716,11 +764,11 @@ public:
   void beginVisibilityResultQuery(Rc<VisibilityResultQuery> &&query);
   void endVisibilityResultQuery(Rc<VisibilityResultQuery> &&query);
   void
-  pushDeferredVisibilityQuerys(Rc<VisibilityResultQuery> *list) {
+  pushDeferredVisibilityQueries(Rc<VisibilityResultQuery> *list) {
     deferred_visibility_query_stack_.push_back(list);
   }
   void
-  popDeferredVisibilityQuerys() {
+  popDeferredVisibilityQueries() {
     assert(!deferred_visibility_query_stack_.empty());
     deferred_visibility_query_stack_.pop_back();
   }
@@ -748,6 +796,11 @@ public:
   void
   setCompatibilityFlag(FeatureCompatibility flag) {
     currentFrameStatistics().compatibility_flags.set(flag);
+  }
+
+  void
+  setIntrapassBarrierControl(uint64_t control_bits) {
+    intrapass_barrier_control_bits_ = control_bits;
   }
 
   ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib);
@@ -840,6 +893,8 @@ private:
   WMT::Reference<WMT::Event> barrier_event_;
   uint64_t barrier_index_ = 0;
 
+  uint64_t intrapass_barrier_control_bits_ = 0;
+
   WMT::Device device_;
   CommandQueue& queue_;
 };
@@ -847,7 +902,7 @@ private:
 template <>
 inline void
 ArgumentEncodingContext::bindOutputBuffer<PipelineStage::Compute>(
-    unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Buffer> &&counter, BufferSlice slice
+    unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Counter> &&counter, BufferSlice slice
 ) {
   auto &entry = cs_uav_[slot];
   entry.texture = {};
@@ -859,7 +914,7 @@ ArgumentEncodingContext::bindOutputBuffer<PipelineStage::Compute>(
 template <>
 inline void
 ArgumentEncodingContext::bindOutputBuffer<PipelineStage::Pixel>(
-    unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Buffer> &&counter, BufferSlice slice
+    unsigned slot, Rc<Buffer> &&buffer, uint64_t viewId, Rc<Counter> &&counter, BufferSlice slice
 ) {
   auto &entry = om_uav_[slot];
   entry.texture = {};
@@ -892,34 +947,40 @@ ArgumentEncodingContext::bindOutputTexture<PipelineStage::Pixel>(
 
 template <PipelineStage stage>
 inline void
-ArgumentEncodingContext::track(GenericAccessTracker &tracker, bool exclusive) {
+ArgumentEncodingContext::track(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentRenderEncoder();
   auto id = current_encoder->encoder_id_vertex;
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
-  if (exclusive)
-    tracker.accessExclusivePreRaster(id, current_encoder->fence_wait_vertex, barrier_state);
+  if (flags & ResourceAccess::Write)
+    tracker.accessExclusivePreRaster(
+        id, current_encoder->fence_wait_vertex, barrier_state, flags & ResourceAccess::UAV
+    );
   else
     tracker.accessSharedPreRaster(id, current_encoder->fence_wait_vertex, barrier_state);
 }
 
 template <>
 inline void
-ArgumentEncodingContext::track<PipelineStage::Compute>(GenericAccessTracker &tracker, bool exclusive) {
+ArgumentEncodingContext::track<PipelineStage::Compute>(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
-  if (exclusive)
-    tracker.accessExclusive(currentEncoderId(), current_encoder->fence_wait, barrier_state);
+  if (flags & ResourceAccess::Write)
+    tracker.accessExclusive(
+        currentEncoderId(), current_encoder->fence_wait, barrier_state, flags & ResourceAccess::UAV
+    );
   else
     tracker.accessShared(currentEncoderId(), current_encoder->fence_wait, barrier_state);
 }
 
 template <>
 inline void
-ArgumentEncodingContext::track<PipelineStage::Pixel>(GenericAccessTracker &tracker, bool exclusive) {
+ArgumentEncodingContext::track<PipelineStage::Pixel>(GenericAccessTracker &tracker, int flags) {
   auto current_encoder = currentRenderEncoder();
   EncoderBarrierState &barrier_state = current_encoder->barrier_state;
-  if (exclusive)
-    tracker.accessExclusiveFragment(currentEncoderId(), current_encoder->fence_wait, barrier_state);
+  if (flags & ResourceAccess::Write)
+    tracker.accessExclusiveFragment(
+        currentEncoderId(), current_encoder->fence_wait, barrier_state, flags & ResourceAccess::UAV
+    );
   else
     tracker.accessSharedFragment(currentEncoderId(), current_encoder->fence_wait, barrier_state);
   return;

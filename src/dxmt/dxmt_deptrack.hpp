@@ -7,11 +7,13 @@
 
 namespace dxmt {
 
-enum DXMT_ENCODER_RESOURCE_ACESS {
-  DXMT_ENCODER_RESOURCE_ACESS_READ = 1 << 0,
-  DXMT_ENCODER_RESOURCE_ACESS_WRITE = 1 << 1,
-  DXMT_ENCODER_RESOURCE_ACESS_READWRITE = DXMT_ENCODER_RESOURCE_ACESS_READ | DXMT_ENCODER_RESOURCE_ACESS_WRITE,
-};
+namespace ResourceAccess {
+constexpr int Read = 1 << 0;
+constexpr int Write = 1 << 1;
+constexpr int ReadWrite = Read | Write;
+constexpr int UAV = 1 << 2;
+constexpr int All = ReadWrite | UAV;
+}; // namespace ResourceAccess
 
 constexpr auto kLog2Lane = 6ull;
 constexpr auto kLane = 1 << kLog2Lane;
@@ -252,23 +254,26 @@ private:
   uint32_t cursor;
 };
 
+constexpr auto kBarrierTypeRW = 1 << 0;
+constexpr auto kBarrierTypeWaW = 1 << 1;
+
 struct EncoderBarrierState {
-  uint64_t barrierSet                       : 1 = 0;
-  uint64_t barrierPreRasterSet              : 1 = 0;
-  uint64_t barrierFragmentAfterPreRasterSet : 1 = 0;
-  uint64_t barrierPreRasterAfterFragmentSet : 1 = 0;
-  uint64_t reserved                         : 60;
+  uint64_t barrierSet                       : 2 = 0;
+  uint64_t barrierPreRasterSet              : 2 = 0;
+  uint64_t barrierFragmentAfterPreRasterSet : 2 = 0;
+  uint64_t barrierPreRasterAfterFragmentSet : 2 = 0;
+  uint64_t reserved                         : 56;
 };
 
 class GenericAccessTracker {
 public:
   void accessShared(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
-  void accessExclusive(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
+  void accessExclusive(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
 
   void accessSharedPreRaster(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
-  void accessExclusivePreRaster(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
+  void accessExclusivePreRaster(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
   void accessSharedFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
-  void accessExclusiveFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state);
+  void accessExclusiveFragment(EncoderId id, FenceSet &wait_fences, EncoderBarrierState &barrier_state, bool uav);
 
 private:
   /**

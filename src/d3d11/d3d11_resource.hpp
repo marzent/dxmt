@@ -154,6 +154,10 @@ struct D3D11ResourceCommon : ID3D11Resource {
   }
 };
 
+inline D3D11ResourceCommon* GetResourceCommon(ID3D11Resource *pResource) {
+  return static_cast<D3D11ResourceCommon *>(pResource);
+}
+
 inline Rc<DynamicBuffer>
 GetDynamicBuffer(ID3D11Resource *pResource, UINT *pBufferLength, UINT *pBindFlags) {
   return static_cast<D3D11ResourceCommon *>(pResource)->dynamicBuffer(pBufferLength, pBindFlags);
@@ -601,7 +605,7 @@ CalculateBufferViewOffsetAndSize(const D3D11_BUFFER_DESC &buffer_desc,
 };
 #pragma endregion
 
-constexpr UINT kD3D11OuputBindFlags =
+constexpr UINT kD3D11OutputBindFlags =
     D3D11_BIND_STREAM_OUTPUT | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_RENDER_TARGET;
 
 } // namespace dxmt
